@@ -117,15 +117,16 @@ impl Postgres {
             // PG18 enables checksums by default; older versions report already disabled.
             let _ = run("pg_checksums", &["-D", &data_arg, "--disable"], true);
         }
+        let postgres = Self { data, log, port };
         let socket = parent.to_string_lossy();
         let options = format!("-F -p {port} -k {socket} -c listen_addresses=127.0.0.1");
         run(
             "pg_ctl",
             &[
                 "-D",
-                &data_arg,
+                &postgres.data.to_string_lossy(),
                 "-l",
-                &log.to_string_lossy(),
+                &postgres.log.to_string_lossy(),
                 "-w",
                 "-o",
                 &options,
@@ -133,7 +134,6 @@ impl Postgres {
             ],
             true,
         )?;
-        let postgres = Self { data, log, port };
         postgres.wait_until_ready().await?;
         Ok(postgres)
     }
@@ -170,7 +170,6 @@ impl Postgres {
 
 impl Drop for Postgres {
     fn drop(&mut self) {
-        let _ = self.stop();
         if let Some(directory) = std::env::var_os("PG_ATTACH_LOG_DIR") {
             let directory = PathBuf::from(directory);
             let name = self
@@ -185,6 +184,7 @@ impl Drop for Postgres {
                 eprintln!("failed to preserve PostgreSQL log: {error}");
             }
         }
+        let _ = self.stop();
         if std::thread::panicking() {
             eprintln!(
                 "PostgreSQL log {}:\n{}",

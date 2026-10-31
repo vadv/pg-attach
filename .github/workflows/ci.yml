@@ -25,8 +25,8 @@ jobs:
       - name: Build, lint and run BDD scenarios
         run: make bdd
 
-      - name: Upload BDD logs on failure
-        if: failure()
+      - name: Upload BDD logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: bdd-logs-pg${{ matrix.pg }}

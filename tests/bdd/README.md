@@ -45,4 +45,4 @@ nix develop ./tests/bdd#pg18
 - `flake.nix` — версионированные dev shells.
 
 Postmaster logs сохраняются в `target/bdd-logs/<major>/`. GitHub Actions
-загружает их как артефакты при failure; job имеет общий timeout 20 минут.
+загружает их как артефакты после каждого запуска; job имеет общий timeout 20 минут.
