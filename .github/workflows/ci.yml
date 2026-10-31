@@ -11,6 +11,7 @@ jobs:
   postgres-matrix:
     name: PostgreSQL ${{ matrix.pg }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -23,3 +24,11 @@ jobs:
 
       - name: Build, lint and run BDD scenarios
         run: make bdd
+
+      - name: Upload BDD logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bdd-logs-pg${{ matrix.pg }}
+          path: target/bdd-logs/
+          if-no-files-found: ignore

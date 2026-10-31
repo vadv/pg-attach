@@ -47,6 +47,11 @@ Feature: Core physical table transfer
       SET enable_seqscan = off;
       SELECT id, length(payload) FROM public.imported_events WHERE id = 42;
       """
+    And the following SQL on "target" contains "imported_events_pkey":
+      """
+      SET enable_seqscan = off;
+      EXPLAIN (COSTS OFF) SELECT id FROM public.imported_events WHERE id = 42;
+      """
 
   Scenario: An empty table is transferred
     When the following SQL is executed on "source":

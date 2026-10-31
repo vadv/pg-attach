@@ -9,4 +9,7 @@ docker build --build-arg PG_VERSION="$PG_VERSION" \
 docker build -f "$root/tests/bdd/Dockerfile" \
   --build-arg PG_VERSION="$PG_VERSION" \
   -t "pg-attach-bdd-pg${PG_VERSION}:dev" "$root"
-exec docker run --rm "pg-attach-bdd-pg${PG_VERSION}:dev"
+log_dir="$root/target/bdd-logs/$PG_VERSION"
+mkdir -p "$log_dir"
+exec docker run --rm -e PG_ATTACH_LOG_DIR=/logs \
+  -v "$log_dir:/logs" "pg-attach-bdd-pg${PG_VERSION}:dev"

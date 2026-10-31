@@ -123,6 +123,30 @@ Feature: Transfer resilience and rollback
       """
 
   @slow
+  Scenario: Hung source operation is interrupted by timeout
+    Given a fresh PostgreSQL pair
+    When the following SQL on "source" is interrupted by timeout:
+      """
+      SELECT pg_sleep(60);
+      """
+    Then the following SQL on "target" returns "1":
+      """
+      SELECT 1;
+      """
+
+  @slow
+  Scenario: Hung target operation is interrupted by timeout
+    Given a fresh PostgreSQL pair
+    When the following SQL on "target" is interrupted by timeout:
+      """
+      SELECT pg_sleep(60);
+      """
+    Then the following SQL on "target" returns "1":
+      """
+      SELECT 1;
+      """
+
+  @slow
   Scenario: Source disconnect during COPY leaves destination unchanged
     Given a fresh PostgreSQL pair
     And the following SQL is executed on "source":

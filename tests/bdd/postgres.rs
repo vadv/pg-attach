@@ -171,6 +171,20 @@ impl Postgres {
 impl Drop for Postgres {
     fn drop(&mut self) {
         let _ = self.stop();
+        if let Some(directory) = std::env::var_os("PG_ATTACH_LOG_DIR") {
+            let directory = PathBuf::from(directory);
+            let name = self
+                .data
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("postgres");
+            let destination = directory.join(format!("{name}-{}.log", self.port));
+            if let Err(error) = std::fs::create_dir_all(&directory)
+                .and_then(|()| std::fs::copy(&self.log, &destination).map(|_| ()))
+            {
+                eprintln!("failed to preserve PostgreSQL log: {error}");
+            }
+        }
         if std::thread::panicking() {
             eprintln!(
                 "PostgreSQL log {}:\n{}",

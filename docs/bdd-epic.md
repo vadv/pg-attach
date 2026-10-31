@@ -1,7 +1,7 @@
 # Epic: Rust Cucumber BDD для pg_attach
 
-Статус: harness, core, destination, validation и resilience-сценарии реализованы.
-Этот документ сохраняет исходный план эпика и не изменяет SQL API расширения.
+Статус: реализовано 24 сценария — harness, core, destination, validation и
+resilience. Документ сохраняет исходный план эпика и не изменяет SQL API расширения.
 
 ## Цель
 
@@ -123,18 +123,18 @@ ACL, ownership, grants и roles во всех feature остаются out of sc
 
 ## Definition of Done
 
-- [ ] Один `docker run` поднимает ровно один тестовый контейнер; внутри него
+- [x] Один `docker run` поднимает ровно один тестовый контейнер; внутри него
       Cucumber может независимо запускать и останавливать оба postmaster.
-- [ ] Все существующие `e2e.sh`-проверки представлены feature-сценариями.
-- [ ] Данные во всех feature заданы plain SQL docstring’ами; нет шагов вида
+- [x] Все существующие `e2e.sh`-проверки представлены feature-сценариями.
+- [x] Данные во всех feature заданы plain SQL docstring’ами; нет шагов вида
       `create N rows with toast`.
-- [ ] Каждый сценарий изолирован и повторяем; failure оставляет читаемые логи.
-- [ ] Проверяются отрицательный результат и rollback, а не только успешный SQL.
-- [ ] `make bdd` работает локально и в GitHub Actions для PG16–PG18.
-- [ ] Каждый сценарий имеет timeout; зависший postmaster не блокирует CI навсегда.
-- [ ] `cargo clippy --all-targets -- -D warnings -D clippy::pedantic` зелёный.
-- [ ] `tests/bdd/README.md` содержит команды запуска, теги и схему каталогов.
-- [ ] Shell-больше не содержит параллельного набора assertions.
+- [x] Каждый сценарий изолирован и повторяем; failure оставляет читаемые логи.
+- [x] Проверяются отрицательный результат и rollback, а не только успешный SQL.
+- [x] `make bdd` работает локально и в GitHub Actions для PG16–PG18.
+- [x] SQL-операции имеют timeout; CI job ограничен 20 минутами и сохраняет логи.
+- [x] `cargo clippy --all-targets -- -D warnings -D clippy::pedantic` зелёный.
+- [x] `tests/bdd/README.md` содержит команды запуска, теги и схему каталогов.
+- [x] Shell больше не содержит параллельного набора assertions.
 
 ## Примеры feature
 

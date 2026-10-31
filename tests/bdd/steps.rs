@@ -89,6 +89,15 @@ async fn cancel_target_import(world: &mut AttachWorld, step: &Step) {
         .unwrap_or_else(|error| panic!("target cancellation failed: {error}"));
 }
 
+#[when(expr = "the following SQL on {string} is interrupted by timeout:")]
+async fn timeout_sql(world: &mut AttachWorld, side: String, step: &Step) {
+    let sql = world.expand_sql(docstring(step));
+    let pair = world.pair.as_ref().expect("PostgreSQL pair is not running");
+    tokio::time::timeout(Duration::from_millis(50), pair.execute(&side, &sql))
+        .await
+        .expect_err("SQL was not interrupted by timeout");
+}
+
 #[then(expr = "the following SQL on {string} returns {string}:")]
 async fn query_result(world: &mut AttachWorld, side: String, expected: String, step: &Step) {
     let sql = docstring(step);
@@ -97,6 +106,24 @@ async fn query_result(world: &mut AttachWorld, side: String, expected: String, s
         .expect("SQL query timed out")
         .unwrap_or_else(|error| panic!("query on {side} failed: {error}\nSQL:\n{sql}"));
     assert_eq!(actual, expected, "unexpected query result\nSQL:\n{sql}");
+}
+
+#[then(expr = "the following SQL on {string} contains {string}:")]
+async fn query_result_contains(
+    world: &mut AttachWorld,
+    side: String,
+    expected: String,
+    step: &Step,
+) {
+    let sql = docstring(step);
+    let actual = tokio::time::timeout(Duration::from_secs(30), world.query(&side, sql))
+        .await
+        .expect("SQL query timed out")
+        .unwrap_or_else(|error| panic!("query on {side} failed: {error}\nSQL:\n{sql}"));
+    assert!(
+        actual.contains(&expected),
+        "query result does not contain {expected:?}: {actual}\nSQL:\n{sql}"
+    );
 }
 
 #[then(expr = "the following SQL on {string} fails with {string}:")]
