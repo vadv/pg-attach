@@ -40,6 +40,19 @@ async fn query_result(world: &mut AttachWorld, side: String, expected: String, s
     assert_eq!(actual, expected, "unexpected query result\nSQL:\n{sql}");
 }
 
+#[then(expr = "the following SQL on {string} fails with {string}:")]
+async fn query_error(world: &mut AttachWorld, side: String, expected: String, step: &Step) {
+    let sql = docstring(step);
+    let error = tokio::time::timeout(Duration::from_secs(30), world.execute(&side, sql))
+        .await
+        .expect("SQL execution timed out")
+        .expect_err("SQL unexpectedly succeeded");
+    assert!(
+        error.contains(&expected),
+        "unexpected SQL error: {error}\nexpected substring: {expected}\nSQL:\n{sql}"
+    );
+}
+
 fn docstring(step: &Step) -> &str {
     step.docstring
         .as_deref()

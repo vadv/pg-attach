@@ -32,7 +32,7 @@ The BDD suite requires Docker and starts two isolated postmasters inside one tes
 make bdd PG_VERSION=17
 ```
 
-The Gherkin scenarios cover heap pages, external TOAST, NULL, btree lookup, empty tables, dropped-column layout and repeated import over an existing destination. Docker builds also run Rust unit tests and strict Clippy lints.
+The Gherkin scenarios cover heap pages, external TOAST, NULL, btree lookup, empty tables, dropped-column layout, full overwrite, auto-created destination constraints/defaults and repeated import with multiple indexes. Docker builds also run Rust unit tests and strict Clippy lints.
 
 For native debugging tools and backtrace commands, see [DEBUG.md](DEBUG.md).
 
