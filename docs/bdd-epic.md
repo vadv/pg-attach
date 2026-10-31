@@ -37,6 +37,44 @@
    tests; Cucumber проверяет пользовательский сценарий и наблюдаемые последствия,
    а не дублирует каждый бинарный тест.
 
+## Feature map для согласования
+
+Это согласованный состав feature-групп. Детальные сценарии review'им в draft PR;
+реализацию harness не начинаем до подтверждения этого списка.
+
+### `transfer.feature` — core transfer
+
+- heap, внешний TOAST, NULL и готовый btree переносятся вместе;
+- пустая таблица переносится без страниц данных;
+- dropped columns сохраняют физический attribute layout;
+- повторный import в то же destination проходит как полный overwrite.
+
+### `destination.feature` — destination modes
+
+- существующая непустая destination полностью перезаписывается;
+- отсутствующая destination создаётся под другим именем;
+- auto-create восстанавливает NOT NULL, defaults, CHECK и обычные btree indexes;
+- несколько индексов и повторный import в auto-created destination работают.
+
+### `validation.feature` — validation and rollback
+
+- различие source/target attributes вызывает ошибку и rollback;
+- unfrozen source tuple отклоняется;
+- unsupported relation и non-btree index отклоняются;
+- отсутствующий source не создаёт и не изменяет destination;
+- после любой ошибки target остаётся доступным для следующего import.
+
+### `resilience.feature` — `@slow`, после стабилизации первых трёх групп
+
+- import с `generate_wal = true` и в no-WAL PoC mode;
+- checksums включены и выключены;
+- обрыв source connection во время COPY не оставляет видимых partial data;
+- отмена import на target не оставляет видимых partial data;
+- зависший source/target прерывается timeout сценария и сохраняет логи.
+
+ACL, ownership, grants и roles во всех feature остаются out of scope и не
+переносятся. Матрица одинаковых feature — PostgreSQL 16–18.
+
 ## Этапы
 
 ### 1. Harness и жизненный цикл
