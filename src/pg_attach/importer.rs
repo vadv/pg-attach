@@ -131,6 +131,7 @@ fn same_index_definition(left: &str, right: &str) -> bool {
         && index_shape(left) == index_shape(right)
 }
 
+#[allow(clippy::cast_possible_wrap)] // PostgreSQL constants are ASCII on either c_char signedness.
 fn reset_storage(rel: &Rel) {
     unsafe {
         pg_sys::RelationSetNewRelfilenumber(

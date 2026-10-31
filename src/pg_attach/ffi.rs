@@ -84,6 +84,7 @@ impl Rel {
         unsafe { pg_attach_toast_index_oid(self.0) }
     }
 
+    #[allow(clippy::cast_possible_wrap)] // PostgreSQL constants are ASCII on either c_char signedness.
     pub fn is_plain_logged_table(&self) -> bool {
         unsafe {
             let rel = &*(*self.0).rd_rel;
@@ -92,6 +93,7 @@ impl Rel {
         }
     }
 
+    #[allow(clippy::cast_possible_wrap)] // PostgreSQL constants are ASCII on either c_char signedness.
     pub fn is_btree(&self) -> bool {
         unsafe {
             let relation = &*self.0;
