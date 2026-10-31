@@ -6,11 +6,11 @@ use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 
 /// Debug-only corruption hook for the BDD suite: flips one byte of the chosen
 /// heap block before page verification. Negative values disable the hook.
-static DEBUG_CORRUPT_PAGE: GucSetting<i32> = GucSetting::new(-1);
-static DEBUG_CORRUPT_OFFSET: GucSetting<i32> = GucSetting::new(-1);
+static DEBUG_CORRUPT_PAGE: GucSetting<i32> = GucSetting::<i32>::new(-1);
+static DEBUG_CORRUPT_OFFSET: GucSetting<i32> = GucSetting::<i32>::new(-1);
 
 #[pg_guard]
-pub extern "C" fn _PG_init() {
+pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_int_guc(
         c"pg_attach.debug_corrupt_page",
         c"Heap block to corrupt during import (debug)",
