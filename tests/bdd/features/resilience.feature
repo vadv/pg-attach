@@ -277,7 +277,7 @@ Feature: Transfer resilience and rollback
       | checksums | offset |
       | enabled   | 8190   |
       | enabled   | 14     |
-      | disabled  | 14     |
+      | disabled  | 13     |
 
   @wal
   Scenario: WAL full-page images reconstruct a deleted heap file
