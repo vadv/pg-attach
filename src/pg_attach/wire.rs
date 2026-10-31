@@ -1,0 +1,655 @@
+use std::fmt;
+use std::io::{self, Read, Write};
+
+pub const MAGIC: [u8; 4] = *b"PGAT";
+pub const VERSION: u16 = 1;
+pub const HEADER_LEN: usize = 12;
+pub const PAGE_HEADER_LEN: usize = 12;
+const SCHEMA_MAGIC: [u8; 4] = *b"PGAS";
+const SCHEMA_VERSION: u16 = 1;
+const SCHEMA_HEADER_LEN: usize = 8;
+const MAX_STRING: usize = 1024 * 1024;
+const MAX_RELATIONS: usize = 1024;
+const MAX_ATTRIBUTES: usize = 1600;
+
+#[derive(Debug)]
+pub struct WireError(pub String);
+
+impl fmt::Display for WireError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl From<io::Error> for WireError {
+    fn from(error: io::Error) -> Self {
+        Self(error.to_string())
+    }
+}
+
+impl From<WireError> for String {
+    fn from(error: WireError) -> Self {
+        error.0
+    }
+}
+
+pub type Result<T> = std::result::Result<T, WireError>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
+pub enum RelationKind {
+    Main = 0,
+    Toast = 1,
+    Index = 2,
+}
+
+impl RelationKind {
+    fn decode(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Main),
+            1 => Ok(Self::Toast),
+            2 => Ok(Self::Index),
+            _ => Err(WireError(format!("unknown relation kind {value}"))),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Relation {
+    pub oid: u32,
+    pub name: String,
+    pub kind: RelationKind,
+    pub fork: u8,
+    pub blocks: u32,
+    pub toast_index_oid: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Attribute {
+    pub name: String,
+    pub type_oid: u32,
+    pub collation_oid: u32,
+    pub typmod: i32,
+    pub len: i16,
+    pub not_null: bool,
+    pub dropped: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaColumn {
+    pub name: String,
+    pub type_name: String,
+    pub collation_name: Option<String>,
+    pub default_expr: Option<String>,
+    pub not_null: bool,
+    pub identity: String,
+    pub generated_expr: Option<String>,
+    pub dropped: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SchemaIndex {
+    /// The part after `USING`, deliberately independent of source table/index names.
+    pub definition: String,
+    pub unique: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableSchema {
+    pub columns: Vec<SchemaColumn>,
+    pub constraints: Vec<String>,
+    pub indexes: Vec<SchemaIndex>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Manifest {
+    pub source_table: String,
+    pub target_table: String,
+    pub checksums: bool,
+    pub relations: Vec<Relation>,
+    pub attributes: Vec<Attribute>,
+    pub index_definitions: Vec<String>,
+}
+
+impl Manifest {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        put_string(&mut out, &self.source_table)?;
+        put_string(&mut out, &self.target_table)?;
+        out.push(u8::from(self.checksums));
+        put_len(&mut out, self.relations.len(), MAX_RELATIONS, "relations")?;
+        for relation in &self.relations {
+            put_u32(&mut out, relation.oid)?;
+            put_string(&mut out, &relation.name)?;
+            out.push(relation.kind as u8);
+            out.push(relation.fork);
+            put_u32(&mut out, relation.blocks)?;
+            put_u32(&mut out, relation.toast_index_oid)?;
+        }
+        put_len(
+            &mut out,
+            self.attributes.len(),
+            MAX_ATTRIBUTES,
+            "attributes",
+        )?;
+        for attribute in &self.attributes {
+            put_string(&mut out, &attribute.name)?;
+            put_u32(&mut out, attribute.type_oid)?;
+            put_u32(&mut out, attribute.collation_oid)?;
+            out.extend_from_slice(&attribute.typmod.to_be_bytes());
+            out.extend_from_slice(&attribute.len.to_be_bytes());
+            out.push(u8::from(attribute.not_null));
+            out.push(u8::from(attribute.dropped));
+        }
+        put_len(
+            &mut out,
+            self.index_definitions.len(),
+            MAX_RELATIONS,
+            "indexes",
+        )?;
+        for definition in &self.index_definitions {
+            put_string(&mut out, definition)?;
+        }
+        Ok(out)
+    }
+
+    pub fn decode(input: &[u8]) -> Result<Self> {
+        let mut decoder = Decoder { input, offset: 0 };
+        let source_table = decoder.string()?;
+        let target_table = decoder.string()?;
+        let checksums = decoder.boolean()?;
+        let relation_count = decoder.len(MAX_RELATIONS, "relations")?;
+        let mut relations = Vec::with_capacity(relation_count);
+        for _ in 0..relation_count {
+            relations.push(Relation {
+                oid: decoder.u32()?,
+                name: decoder.string()?,
+                kind: RelationKind::decode(decoder.u8()?)?,
+                fork: decoder.u8()?,
+                blocks: decoder.u32()?,
+                toast_index_oid: decoder.u32()?,
+            });
+        }
+        let attribute_count = decoder.len(MAX_ATTRIBUTES, "attributes")?;
+        let mut attributes = Vec::with_capacity(attribute_count);
+        for _ in 0..attribute_count {
+            attributes.push(Attribute {
+                name: decoder.string()?,
+                type_oid: decoder.u32()?,
+                collation_oid: decoder.u32()?,
+                typmod: decoder.i32()?,
+                len: decoder.i16()?,
+                not_null: decoder.boolean()?,
+                dropped: decoder.boolean()?,
+            });
+        }
+        let index_count = decoder.len(MAX_RELATIONS, "indexes")?;
+        let mut index_definitions = Vec::with_capacity(index_count);
+        for _ in 0..index_count {
+            index_definitions.push(decoder.string()?);
+        }
+        if decoder.offset != input.len() {
+            return Err(WireError("trailing bytes in manifest".into()));
+        }
+        Ok(Self {
+            source_table,
+            target_table,
+            checksums,
+            relations,
+            attributes,
+            index_definitions,
+        })
+    }
+}
+
+pub fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&SCHEMA_MAGIC);
+    out.extend_from_slice(&SCHEMA_VERSION.to_be_bytes());
+    out.extend_from_slice(&0u16.to_be_bytes());
+    put_len(
+        &mut out,
+        schema.columns.len(),
+        MAX_ATTRIBUTES,
+        "schema columns",
+    )?;
+    for column in &schema.columns {
+        put_string(&mut out, &column.name)?;
+        put_string(&mut out, &column.type_name)?;
+        put_optional_string(&mut out, column.collation_name.as_deref())?;
+        put_optional_string(&mut out, column.default_expr.as_deref())?;
+        out.push(u8::from(column.not_null));
+        put_string(&mut out, &column.identity)?;
+        put_optional_string(&mut out, column.generated_expr.as_deref())?;
+        out.push(u8::from(column.dropped));
+    }
+    put_len(
+        &mut out,
+        schema.constraints.len(),
+        MAX_RELATIONS,
+        "constraints",
+    )?;
+    for constraint in &schema.constraints {
+        put_string(&mut out, constraint)?;
+    }
+    put_len(
+        &mut out,
+        schema.indexes.len(),
+        MAX_RELATIONS,
+        "schema indexes",
+    )?;
+    for index in &schema.indexes {
+        put_string(&mut out, &index.definition)?;
+        out.push(u8::from(index.unique));
+    }
+    Ok(out)
+}
+
+pub fn decode_schema(input: &[u8]) -> Result<TableSchema> {
+    if input.len() < SCHEMA_HEADER_LEN || input[..4] != SCHEMA_MAGIC {
+        return Err(WireError("bad pg_attach schema magic".into()));
+    }
+    if u16::from_be_bytes([input[4], input[5]]) != SCHEMA_VERSION || input[6] != 0 || input[7] != 0
+    {
+        return Err(WireError("unsupported pg_attach schema header".into()));
+    }
+    let mut decoder = Decoder {
+        input: &input[SCHEMA_HEADER_LEN..],
+        offset: 0,
+    };
+    let column_count = decoder.len(MAX_ATTRIBUTES, "schema columns")?;
+    let mut columns = Vec::with_capacity(column_count);
+    for _ in 0..column_count {
+        columns.push(SchemaColumn {
+            name: decoder.string()?,
+            type_name: decoder.string()?,
+            collation_name: decoder.optional_string()?,
+            default_expr: decoder.optional_string()?,
+            not_null: decoder.boolean()?,
+            identity: decoder.string()?,
+            generated_expr: decoder.optional_string()?,
+            dropped: decoder.boolean()?,
+        });
+    }
+    let constraint_count = decoder.len(MAX_RELATIONS, "constraints")?;
+    let mut constraints = Vec::with_capacity(constraint_count);
+    for _ in 0..constraint_count {
+        constraints.push(decoder.string()?);
+    }
+    let index_count = decoder.len(MAX_RELATIONS, "schema indexes")?;
+    let mut indexes = Vec::with_capacity(index_count);
+    for _ in 0..index_count {
+        indexes.push(SchemaIndex {
+            definition: decoder.string()?,
+            unique: decoder.boolean()?,
+        });
+    }
+    if decoder.offset != decoder.input.len() {
+        return Err(WireError("trailing bytes in schema descriptor".into()));
+    }
+    Ok(TableSchema {
+        columns,
+        constraints,
+        indexes,
+    })
+}
+
+#[cfg(test)]
+pub struct StreamWriter<W> {
+    inner: W,
+}
+
+#[cfg(test)]
+impl<W: Write> StreamWriter<W> {
+    pub fn new(mut inner: W, manifest: &Manifest) -> Result<Self> {
+        inner.write_all(&encode_header(manifest)?)?;
+        Ok(Self { inner })
+    }
+
+    pub fn page(&mut self, relation: u16, fork: u8, block: u32, page: &[u8]) -> Result<()> {
+        self.inner
+            .write_all(&encode_page(relation, fork, block, page)?)?;
+        Ok(())
+    }
+
+    pub fn done(mut self) -> Result<W> {
+        self.inner.write_all(&[0, 0, 0, 0])?;
+        self.inner.flush()?;
+        Ok(self.inner)
+    }
+}
+
+pub fn encode_header(manifest: &Manifest) -> Result<Vec<u8>> {
+    let manifest = manifest.encode()?;
+    let mut output = Vec::with_capacity(HEADER_LEN + manifest.len());
+    output.extend_from_slice(&MAGIC);
+    output.extend_from_slice(&VERSION.to_be_bytes());
+    output.extend_from_slice(&0u16.to_be_bytes());
+    put_u32(
+        &mut output,
+        u32::try_from(manifest.len()).map_err(|_| WireError("manifest too large".into()))?,
+    )?;
+    output.extend_from_slice(&manifest);
+    Ok(output)
+}
+
+pub fn encode_page(relation: u16, fork: u8, block: u32, page: &[u8]) -> Result<Vec<u8>> {
+    if page.len() != 8192 {
+        return Err(WireError(format!("invalid page size {}", page.len())));
+    }
+    let mut output = Vec::with_capacity(PAGE_HEADER_LEN + page.len());
+    put_u16(&mut output, relation)?;
+    output.extend_from_slice(&[fork, 0]);
+    put_u32(&mut output, block)?;
+    put_u32(
+        &mut output,
+        u32::try_from(page.len()).expect("page length fits u32"),
+    )?;
+    output.extend_from_slice(page);
+    Ok(output)
+}
+
+pub struct StreamReader<R> {
+    #[allow(dead_code)] // Production consumes only the header; tests also read pages.
+    inner: R,
+    pub manifest: Manifest,
+}
+
+impl<R: Read> StreamReader<R> {
+    pub fn new(mut inner: R) -> Result<Self> {
+        let mut header = [0u8; HEADER_LEN];
+        inner.read_exact(&mut header)?;
+        if header[..4] != MAGIC {
+            return Err(WireError("bad pg_attach magic".into()));
+        }
+        if u16::from_be_bytes([header[4], header[5]]) != VERSION {
+            return Err(WireError("unsupported pg_attach protocol version".into()));
+        }
+        if header[6] != 0 || header[7] != 0 {
+            return Err(WireError("unsupported pg_attach header flags".into()));
+        }
+        let length = usize::try_from(u32::from_be_bytes(header[8..12].try_into().unwrap()))
+            .expect("u32 length fits usize");
+        if length == 0 || length > MAX_STRING * 16 {
+            return Err(WireError(format!("invalid manifest length {length}")));
+        }
+        let mut manifest = vec![0; length];
+        inner.read_exact(&mut manifest)?;
+        let manifest = Manifest::decode(&manifest)?;
+        Ok(Self { inner, manifest })
+    }
+
+    #[cfg(test)]
+    pub fn next(&mut self) -> Result<Option<PagePacket>> {
+        let mut first = [0u8; 4];
+        match self.inner.read_exact(&mut first) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                return Err(WireError("truncated pg_attach stream".into()));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        let mut header = [0u8; PAGE_HEADER_LEN];
+        header[..4].copy_from_slice(&first);
+        if first == [0, 0, 0, 0] {
+            let mut fifth = [0u8; 1];
+            match self.inner.read_exact(&mut fifth) {
+                Ok(()) => header[4] = fifth[0],
+                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error.into()),
+            }
+            self.inner.read_exact(&mut header[5..])?;
+        } else {
+            self.inner.read_exact(&mut header[4..])?;
+        }
+        if header[3] != 0 {
+            return Err(WireError("unsupported page packet flags".into()));
+        }
+        let length = usize::try_from(u32::from_be_bytes(header[8..12].try_into().unwrap()))
+            .expect("u32 length fits usize");
+        if length != 8192 {
+            return Err(WireError(format!("invalid page payload length {length}")));
+        }
+        let mut bytes = vec![0; length];
+        self.inner.read_exact(&mut bytes)?;
+        Ok(Some(PagePacket {
+            relation: u16::from_be_bytes([header[0], header[1]]),
+            fork: header[2],
+            block: u32::from_be_bytes(header[4..8].try_into().unwrap()),
+            bytes,
+        }))
+    }
+}
+
+pub fn decode_page(input: &[u8]) -> Result<Option<PagePacket>> {
+    if input == [0, 0, 0, 0] {
+        return Ok(None);
+    }
+    if input.len() != PAGE_HEADER_LEN + 8192 {
+        return Err(WireError(format!(
+            "invalid page row length {}",
+            input.len()
+        )));
+    }
+    if input[3] != 0 {
+        return Err(WireError("unsupported page packet flags".into()));
+    }
+    let length = usize::try_from(u32::from_be_bytes(input[8..12].try_into().unwrap()))
+        .expect("u32 length fits usize");
+    if length != 8192 {
+        return Err(WireError(format!("invalid page payload length {length}")));
+    }
+    Ok(Some(PagePacket {
+        relation: u16::from_be_bytes([input[0], input[1]]),
+        fork: input[2],
+        block: u32::from_be_bytes(input[4..8].try_into().unwrap()),
+        bytes: input[PAGE_HEADER_LEN..].to_vec(),
+    }))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PagePacket {
+    pub relation: u16,
+    pub fork: u8,
+    pub block: u32,
+    pub bytes: Vec<u8>,
+}
+
+fn put_u16(output: &mut impl Write, value: u16) -> Result<()> {
+    output.write_all(&value.to_be_bytes())?;
+    Ok(())
+}
+
+fn put_u32(output: &mut impl Write, value: u32) -> Result<()> {
+    output.write_all(&value.to_be_bytes())?;
+    Ok(())
+}
+
+fn put_len(output: &mut Vec<u8>, len: usize, max: usize, what: &str) -> Result<()> {
+    if len > max {
+        return Err(WireError(format!("too many {what}: {len}")));
+    }
+    put_u32(
+        output,
+        u32::try_from(len).map_err(|_| WireError(format!("too many {what}: {len}")))?,
+    )?;
+    Ok(())
+}
+
+fn put_string(output: &mut Vec<u8>, value: &str) -> Result<()> {
+    if value.len() > MAX_STRING {
+        return Err(WireError("string exceeds wire limit".into()));
+    }
+    put_u32(
+        output,
+        u32::try_from(value.len()).map_err(|_| WireError("string exceeds wire limit".into()))?,
+    )?;
+    output.extend_from_slice(value.as_bytes());
+    Ok(())
+}
+
+fn put_optional_string(output: &mut Vec<u8>, value: Option<&str>) -> Result<()> {
+    output.push(u8::from(value.is_some()));
+    if let Some(value) = value {
+        put_string(output, value)?;
+    }
+    Ok(())
+}
+
+struct Decoder<'a> {
+    input: &'a [u8],
+    offset: usize,
+}
+
+impl Decoder<'_> {
+    fn take(&mut self, length: usize) -> Result<&[u8]> {
+        let end = self
+            .offset
+            .checked_add(length)
+            .ok_or_else(|| WireError("length overflow".into()))?;
+        let bytes = self
+            .input
+            .get(self.offset..end)
+            .ok_or_else(|| WireError("truncated manifest".into()))?;
+        self.offset = end;
+        Ok(bytes)
+    }
+
+    fn u8(&mut self) -> Result<u8> {
+        Ok(self.take(1)?[0])
+    }
+
+    fn u32(&mut self) -> Result<u32> {
+        Ok(u32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn i32(&mut self) -> Result<i32> {
+        Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
+    }
+
+    fn i16(&mut self) -> Result<i16> {
+        Ok(i16::from_be_bytes(self.take(2)?.try_into().unwrap()))
+    }
+
+    fn boolean(&mut self) -> Result<bool> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            value => Err(WireError(format!("invalid boolean {value}"))),
+        }
+    }
+
+    fn len(&mut self, max: usize, what: &str) -> Result<usize> {
+        let len = usize::try_from(self.u32()?).expect("u32 length fits usize");
+        if len > max {
+            Err(WireError(format!("too many {what}: {len}")))
+        } else {
+            Ok(len)
+        }
+    }
+
+    fn string(&mut self) -> Result<String> {
+        let length = usize::try_from(self.u32()?).expect("u32 length fits usize");
+        if length > MAX_STRING {
+            return Err(WireError("string exceeds wire limit".into()));
+        }
+        String::from_utf8(self.take(length)?.to_vec())
+            .map_err(|_| WireError("manifest string is not UTF-8".into()))
+    }
+
+    fn optional_string(&mut self) -> Result<Option<String>> {
+        if self.boolean()? {
+            Ok(Some(self.string()?))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn manifest() -> Manifest {
+        Manifest {
+            source_table: "public.events".into(),
+            target_table: "public.events_copy".into(),
+            checksums: true,
+            relations: vec![Relation {
+                oid: 42,
+                name: "events".into(),
+                kind: RelationKind::Main,
+                fork: 0,
+                blocks: 1,
+                toast_index_oid: 0,
+            }],
+            attributes: vec![Attribute {
+                name: "id".into(),
+                type_oid: 23,
+                collation_oid: 0,
+                typmod: -1,
+                len: 4,
+                not_null: true,
+                dropped: false,
+            }],
+            index_definitions: vec![
+                "CREATE INDEX events_id_idx ON public.events USING btree (id)".into(),
+            ],
+        }
+    }
+
+    #[test]
+    fn schema_round_trip_preserves_target_independent_definitions() {
+        let value = TableSchema {
+            columns: vec![SchemaColumn {
+                name: "payload".into(),
+                type_name: "text".into(),
+                collation_name: Some("pg_catalog.\"C\"".into()),
+                default_expr: Some("'default'::text".into()),
+                not_null: true,
+                identity: String::new(),
+                generated_expr: None,
+                dropped: false,
+            }],
+            constraints: vec!["CHECK (length(payload) > 0)".into()],
+            indexes: vec![SchemaIndex {
+                definition: "btree (payload)".into(),
+                unique: true,
+            }],
+        };
+        let encoded = encode_schema(&value).unwrap();
+        assert_eq!(decode_schema(&encoded).unwrap(), value);
+        assert!(!encoded
+            .windows(b"source_table".len())
+            .any(|w| w == b"source_table"));
+    }
+
+    #[test]
+    fn manifest_round_trip() {
+        let value = manifest();
+        assert_eq!(Manifest::decode(&value.encode().unwrap()).unwrap(), value);
+    }
+
+    #[test]
+    fn page_stream_round_trip() {
+        let value = manifest();
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::new(&mut bytes, &value).unwrap();
+        writer.page(0, 0, 7, &[5; 8192]).unwrap();
+        writer.done().unwrap();
+        let mut reader = StreamReader::new(bytes.as_slice()).unwrap();
+        let packet = reader.next().unwrap().unwrap();
+        assert_eq!(packet.block, 7);
+        assert_eq!(packet.bytes, vec![5; 8192]);
+        assert!(reader.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn rejects_bad_magic() {
+        let mut bytes = vec![0; HEADER_LEN];
+        bytes[..4].copy_from_slice(b"NOPE");
+        assert!(StreamReader::new(bytes.as_slice()).is_err());
+    }
+}

@@ -1,0 +1,48 @@
+services:
+  source:
+    build:
+      context: .
+      args:
+        PG_VERSION: ${PG_VERSION:-17}
+    image: pg-attach-pg${PG_VERSION:-17}:dev
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "55432:5432"
+    volumes:
+      - source-data:/var/lib/postgresql
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d app"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  target:
+    image: pg-attach-pg${PG_VERSION:-17}:dev
+    environment:
+      POSTGRES_DB: app
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    ports:
+      - "55433:5432"
+    volumes:
+      - target-data:/var/lib/postgresql
+    cap_add:
+      - SYS_PTRACE
+    security_opt:
+      - seccomp:unconfined
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d app"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+volumes:
+  source-data:
+  target-data:

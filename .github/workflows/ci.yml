@@ -1,0 +1,33 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  postgres-matrix:
+    name: PostgreSQL ${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17, 18]
+    env:
+      PG_VERSION: ${{ matrix.pg }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Build, lint and run e2e
+        run: ./e2e.sh
+
+      - name: Collect PostgreSQL logs on failure
+        if: failure()
+        run: docker compose logs --no-color source target
+
+      - name: Clean up
+        if: always()
+        run: docker compose down -v
