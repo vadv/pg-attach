@@ -10,11 +10,15 @@ use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 pub struct PostgresPair {
     source: Postgres,
     target: Postgres,
-    _temp: TempDir,
+    temp: TempDir,
 }
 
 impl PostgresPair {
     pub async fn start() -> Result<Self, String> {
+        Self::start_with_checksums(false).await
+    }
+
+    pub async fn start_with_checksums(checksums: bool) -> Result<Self, String> {
         let temp = TempDir::new().map_err(|error| error.to_string())?;
         if is_root() {
             run(
@@ -23,12 +27,12 @@ impl PostgresPair {
                 false,
             )?;
         }
-        let source = Postgres::start(temp.path(), "source").await?;
-        let target = Postgres::start(temp.path(), "target").await?;
+        let source = Postgres::start(temp.path(), "source", checksums).await?;
+        let target = Postgres::start(temp.path(), "target", checksums).await?;
         Ok(Self {
             source,
             target,
-            _temp: temp,
+            temp,
         })
     }
 
@@ -55,6 +59,34 @@ impl PostgresPair {
     pub async fn query(&self, side: &str, sql: &str) -> Result<String, String> {
         query(self.port(side), sql).await
     }
+
+    pub async fn create_tablespace(&self, side: &str) -> Result<(), String> {
+        let path = self.temp.path().join("tablespace");
+        std::fs::create_dir(&path).map_err(|error| error.to_string())?;
+        if is_root() {
+            run(
+                "chown",
+                &["postgres:postgres", &path.to_string_lossy()],
+                false,
+            )?;
+        }
+        self.execute(
+            side,
+            &format!(
+                "CREATE TABLESPACE attach_space LOCATION '{}'",
+                path.to_string_lossy()
+            ),
+        )
+        .await
+    }
+
+    pub fn stop_source(&self) -> Result<(), String> {
+        self.source.stop()
+    }
+
+    pub async fn cancel_target(&self, sql: &str, delay: Duration) -> Result<(), String> {
+        cancel_execute(self.target.port, sql, delay).await
+    }
 }
 
 #[derive(Debug)]
@@ -65,22 +97,26 @@ struct Postgres {
 }
 
 impl Postgres {
-    async fn start(parent: &Path, name: &str) -> Result<Self, String> {
+    async fn start(parent: &Path, name: &str, checksums: bool) -> Result<Self, String> {
         let data = parent.join(name);
         let log = parent.join(format!("{name}.log"));
         let port = unused_port()?;
         let data_arg = data.to_string_lossy().into_owned();
-        run(
-            "initdb",
-            &[
-                "-D",
-                &data_arg,
-                "--no-sync",
-                "--auth=trust",
-                "--username=postgres",
-            ],
-            true,
-        )?;
+        let mut initdb_args = vec![
+            "-D",
+            &data_arg,
+            "--no-sync",
+            "--auth=trust",
+            "--username=postgres",
+        ];
+        if checksums {
+            initdb_args.push("--data-checksums");
+        }
+        run("initdb", &initdb_args, true)?;
+        if !checksums {
+            // PG18 enables checksums by default; older versions report already disabled.
+            let _ = run("pg_checksums", &["-D", &data_arg, "--disable"], true);
+        }
         let socket = parent.to_string_lossy();
         let options = format!("-F -p {port} -k {socket} -c listen_addresses=127.0.0.1");
         run(
@@ -102,6 +138,21 @@ impl Postgres {
         Ok(postgres)
     }
 
+    fn stop(&self) -> Result<(), String> {
+        run(
+            "pg_ctl",
+            &[
+                "-D",
+                &self.data.to_string_lossy(),
+                "-w",
+                "-m",
+                "immediate",
+                "stop",
+            ],
+            true,
+        )
+    }
+
     async fn wait_until_ready(&self) -> Result<(), String> {
         for _ in 0..100 {
             if query(self.port, "SELECT 1").await.as_deref() == Ok("1") {
@@ -119,18 +170,7 @@ impl Postgres {
 
 impl Drop for Postgres {
     fn drop(&mut self) {
-        let _ = run(
-            "pg_ctl",
-            &[
-                "-D",
-                &self.data.to_string_lossy(),
-                "-w",
-                "-m",
-                "immediate",
-                "stop",
-            ],
-            true,
-        );
+        let _ = self.stop();
         if std::thread::panicking() {
             eprintln!(
                 "PostgreSQL log {}:\n{}",
@@ -159,6 +199,30 @@ async fn connect(port: u16) -> Result<(Client, tokio::task::JoinHandle<()>), Str
         }
     });
     Ok((client, task))
+}
+
+async fn cancel_execute(port: u16, sql: &str, delay: Duration) -> Result<(), String> {
+    let (client, task) = connect(port).await?;
+    let cancel = client.cancel_token();
+    let result = {
+        let execution = client.batch_execute(sql);
+        tokio::pin!(execution);
+        tokio::select! {
+            result = &mut execution => {
+                return Err(format!("import finished before cancellation: {result:?}"));
+            }
+            () = tokio::time::sleep(delay) => {
+                cancel.cancel_query(NoTls).await.map_err(|error| error.to_string())?;
+                execution.await
+            }
+        }
+    };
+    drop(client);
+    let _ = task.await;
+    match result {
+        Ok(()) => Err("cancelled import unexpectedly succeeded".to_string()),
+        Err(_) => Ok(()),
+    }
 }
 
 async fn execute(port: u16, sql: &str) -> Result<(), String> {

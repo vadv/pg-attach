@@ -1,7 +1,7 @@
 # Epic: Rust Cucumber BDD для pg_attach
 
-Статус: план, не реализовано. Этот документ описывает отдельный эпик и не
-изменяет текущий SQL API расширения.
+Статус: harness, core, destination, validation и resilience-сценарии реализованы.
+Этот документ сохраняет исходный план эпика и не изменяет SQL API расширения.
 
 ## Цель
 
@@ -37,10 +37,9 @@
 5. Низкоуровневый wire/heap/TOAST тестируется отдельными Rust unit/integration
    tests; Cucumber проверяет пользовательский сценарий и наблюдаемые последствия,
    а не дублирует каждый бинарный тест.
-6. BDD — отдельный Rust crate и отдельный Docker image. Небольшой Nix devShell
-   содержит только инструменты разработки harness; полный изолированный запуск
-   выполняет `tests/bdd/run.sh`. Каждый файл harness имеет одну явную задачу,
-   без скрытых фреймворков и генераторов данных.
+6. BDD — отдельный Rust crate и отдельный Docker image. Полный изолированный
+   запуск выполняет `make bdd PG_VERSION=17`. Каждый файл harness имеет одну явную
+   задачу, без скрытых фреймворков и генераторов данных.
 
 ## Feature map для согласования
 
@@ -116,12 +115,11 @@ ACL, ownership, grants и roles во всех feature остаются out of sc
 
 ### 4. CI и удаление shell-дублирования
 
-- `tests/bdd/run.sh` собирает основной image и отдельный BDD image;
+- `make build` собирает основной image, а `make bdd` — отдельный BDD image;
 - один `docker run --rm` запускает сценарии в контейнере, где находятся оба
   postmaster;
 - CI публикует логи и имеет timeout на весь сценарий;
-- после полного переноса `e2e.sh` удаляется либо остаётся только маленьким smoke
-  wrapper без собственного набора проверок.
+- параллельный `e2e.sh` со своим набором assertions удалён.
 
 ## Definition of Done
 
@@ -132,7 +130,7 @@ ACL, ownership, grants и roles во всех feature остаются out of sc
       `create N rows with toast`.
 - [ ] Каждый сценарий изолирован и повторяем; failure оставляет читаемые логи.
 - [ ] Проверяются отрицательный результат и rollback, а не только успешный SQL.
-- [ ] `tests/bdd/run.sh` работает локально и в GitHub Actions для PG16–PG18.
+- [ ] `make bdd` работает локально и в GitHub Actions для PG16–PG18.
 - [ ] Каждый сценарий имеет timeout; зависший postmaster не блокирует CI навсегда.
 - [ ] `cargo clippy --all-targets -- -D warnings -D clippy::pedantic` зелёный.
 - [ ] `tests/bdd/README.md` содержит команды запуска, теги и схему каталогов.
