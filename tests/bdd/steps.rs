@@ -68,7 +68,7 @@ async fn record_target_data_file(world: &mut AttachWorld, relation: String) {
 }
 
 #[when("target postmaster is crashed")]
-async fn crash_target_without_restart(world: &mut AttachWorld) {
+fn crash_target_without_restart(world: &mut AttachWorld) {
     world
         .pair
         .as_mut()
@@ -78,21 +78,27 @@ async fn crash_target_without_restart(world: &mut AttachWorld) {
 }
 
 #[when("the recorded target data file is removed")]
-async fn remove_recorded_data_file(world: &mut AttachWorld) {
+fn remove_recorded_data_file(world: &mut AttachWorld) {
     let path = world
         .recorded_data_file
         .clone()
         .expect("no recorded target data file");
-    assert!(path.exists(), "recorded data file {path:?} does not exist");
-    std::fs::remove_file(&path).unwrap_or_else(|error| panic!("failed to remove {path:?}: {error}"));
+    assert!(
+        path.exists(),
+        "recorded data file {} does not exist",
+        path.display()
+    );
+    std::fs::remove_file(&path)
+        .unwrap_or_else(|error| panic!("failed to remove {}: {error}", path.display()));
     let stem = path.file_name().expect("file name").to_string_lossy().into_owned();
     for segment in 1.. {
         let sibling = path.with_file_name(format!("{stem}_{segment}"));
         if !sibling.exists() {
             break;
         }
-        std::fs::remove_file(&sibling)
-            .unwrap_or_else(|error| panic!("failed to remove {sibling:?}: {error}"));
+        std::fs::remove_file(&sibling).unwrap_or_else(|error| {
+            panic!("failed to remove {}: {error}", sibling.display())
+        });
     }
 }
 
