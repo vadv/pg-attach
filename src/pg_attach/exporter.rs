@@ -127,7 +127,8 @@ pub unsafe fn export_schema(source_table: &str) -> Result<Vec<u8>, String> {
     let columns = Spi::connect_mut(|client| {
         let rows = client
             .select(
-                "SELECT a.attname::text, format_type(a.atttypid, a.atttypmod), \
+                "SELECT a.attname::text, CASE WHEN a.attisdropped THEN 'text' \
+                 ELSE format_type(a.atttypid, a.atttypmod) END, \
                  CASE WHEN a.attcollation <> 0 AND a.attcollation <> t.typcollation \
                  THEN (SELECT format('%I.%I', n.nspname, c.collname) \
                        FROM pg_collation c JOIN pg_namespace n ON n.oid = c.collnamespace \
@@ -135,7 +136,7 @@ pub unsafe fn export_schema(source_table: &str) -> Result<Vec<u8>, String> {
                  pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.attidentity::text, \
                  CASE WHEN a.attgenerated <> '' THEN pg_get_expr(d.adbin, d.adrelid) END, \
                  a.attisdropped \
-                 FROM pg_attribute a JOIN pg_type t ON t.oid = a.atttypid \
+                 FROM pg_attribute a LEFT JOIN pg_type t ON t.oid = a.atttypid \
                  LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
                  WHERE a.attrelid = $1 AND a.attnum > 0 ORDER BY a.attnum",
                 None,

@@ -12,8 +12,8 @@ PostgreSQL 16, 17, 18 и 19. Это не cross-version physical upgrade: page la
 
 - `pg16`, `pg17`, `pg18` — отдельные Cargo features pgrx 0.19.3;
 - каждая сборка выбирает ровно одну feature и соответствующий `pg_config`;
-- локальный Docker e2e и strict build пройдены на PostgreSQL 16, 17 и 18;
-- GitHub Actions должен запускать build/lint/e2e для каждой доступной major;
+- локальный Docker BDD и strict build пройдены на PostgreSQL 16, 17 и 18;
+- GitHub Actions запускает build/lint/BDD для каждой поддерживаемой major;
 - PostgreSQL 19 не входит в matrix до stable release;
 - зелёная компиляция не считается доказательством физической совместимости.
 
@@ -81,7 +81,7 @@ SMGR page I/O и WAL/fsync. Дальнейшие сокращения:
       указаны ограничения replicas/PITR.
 - [ ] Добавлены Rust unit/integration и BDD-сценарии без shell-only assertions.
 - [ ] `cargo fmt --check`, строгий Clippy, unit tests и соответствующий Docker
-      e2e зелёные; warnings не подавляются без письменной причины.
+      BDD зелёные; warnings не подавляются без письменной причины.
 - [ ] Для per-page изменений есть benchmark до/после; регрессия throughput
       объяснена и принята, а не скрыта.
 

@@ -21,13 +21,5 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
-      - name: Build, lint and run e2e
-        run: ./e2e.sh
-
-      - name: Collect PostgreSQL logs on failure
-        if: failure()
-        run: docker compose logs --no-color source target
-
-      - name: Clean up
-        if: always()
-        run: docker compose down -v
+      - name: Build, lint and run BDD scenarios
+        run: make bdd
