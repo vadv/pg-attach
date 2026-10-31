@@ -99,18 +99,41 @@ pg_attach_prepare_page(Page page, BlockNumber blkno, bool checksums)
 }
 
 bool
-pg_attach_verify_page(Page page, BlockNumber blkno)
+pg_attach_verify_page(Page page, BlockNumber blkno, bool checksums)
 {
-    uint16 stored = ((PageHeader) page)->pd_checksum;
+    PageHeader phdr = (PageHeader) page;
+    uint16 stored;
     bool ok;
+    int i;
 
+    if (PageIsNew(page))
+    {
+        /* A new page is legitimate only when entirely zeroed; the checksum
+         * setters skip such pages, so they must never pass by default. */
+        for (i = 0; i < BLCKSZ; i++)
+            if (((const char *) page)[i] != 0)
+                return false;
+        return true;
+    }
+
+    if (phdr->pd_lower < SizeOfPageHeaderData ||
+        phdr->pd_lower > phdr->pd_upper ||
+        phdr->pd_upper > phdr->pd_special ||
+        phdr->pd_special > BLCKSZ ||
+        phdr->pd_special != MAXALIGN(phdr->pd_special))
+        return false;
+
+    if (!checksums)
+        return true;
+
+    stored = phdr->pd_checksum;
 #if PG_VERSION_NUM >= 190000
     PageSetChecksum(page, blkno);
 #else
     PageSetChecksumInplace(page, blkno);
 #endif
-    ok = ((PageHeader) page)->pd_checksum == stored;
-    ((PageHeader) page)->pd_checksum = stored;
+    ok = phdr->pd_checksum == stored;
+    phdr->pd_checksum = stored;
     return ok;
 }
 

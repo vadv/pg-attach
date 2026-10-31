@@ -2,6 +2,37 @@ use pgrx::prelude::*;
 
 pgrx::pg_module_magic!();
 
+use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
+
+/// Debug-only corruption hook for the BDD suite: flips one byte of the chosen
+/// heap block before page verification. Negative values disable the hook.
+static DEBUG_CORRUPT_PAGE: GucSetting<i32> = GucSetting::new(-1);
+static DEBUG_CORRUPT_OFFSET: GucSetting<i32> = GucSetting::new(-1);
+
+#[pg_guard]
+pub extern "C" fn _PG_init() {
+    GucRegistry::define_int_guc(
+        c"pg_attach.debug_corrupt_page",
+        c"Heap block to corrupt during import (debug)",
+        c"Flips one byte of this heap relation block before page verification. -1 disables.",
+        &DEBUG_CORRUPT_PAGE,
+        -1,
+        i32::MAX,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"pg_attach.debug_corrupt_offset",
+        c"Byte offset to corrupt during import (debug)",
+        c"Flips the byte at this offset of the block chosen by pg_attach.debug_corrupt_page.",
+        &DEBUG_CORRUPT_OFFSET,
+        -1,
+        8191,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+}
+
 pub mod pg_attach {
     use super::{pg_extern, pg_sys, SetOfIterator};
 

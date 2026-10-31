@@ -27,7 +27,11 @@ unsafe extern "C" {
         dst: *mut c_char,
     );
     fn pg_attach_prepare_page(page: *mut c_char, block: pg_sys::BlockNumber, checksums: bool);
-    fn pg_attach_verify_page(page: *mut c_char, block: pg_sys::BlockNumber) -> bool;
+    fn pg_attach_verify_page(
+        page: *mut c_char,
+        block: pg_sys::BlockNumber,
+        checksums: bool,
+    ) -> bool;
     fn pg_attach_heap_page_is_frozen(page: *const c_char) -> bool;
     fn pg_attach_prepare_heap_page(
         page: *mut c_char,
@@ -186,9 +190,9 @@ impl Rel {
 
     /// # Panics
     /// Panics when `page` is shorter than one block.
-    pub fn verify_page(block: u32, page: &mut [u8]) -> bool {
+    pub fn verify_page(block: u32, page: &mut [u8], checksums: bool) -> bool {
         assert_eq!(page.len(), PAGE_SIZE);
-        unsafe { guard(|| pg_attach_verify_page(page.as_mut_ptr().cast(), block)) }
+        unsafe { guard(|| pg_attach_verify_page(page.as_mut_ptr().cast(), block, checksums)) }
     }
 
     pub fn visibility_map(&self) -> VisibilityMap<'_> {

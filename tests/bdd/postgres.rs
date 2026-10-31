@@ -94,6 +94,22 @@ impl PostgresPair {
         self.target.restart().await
     }
 
+    pub fn crash_target_only(&self) -> Result<(), String> {
+        self.target.crash()
+    }
+
+    pub async fn start_target(&self) -> Result<(), String> {
+        self.target.restart().await
+    }
+
+    pub fn target_data_path(&self, relative: &str) -> PathBuf {
+        if std::path::Path::new(relative).is_absolute() {
+            PathBuf::from(relative)
+        } else {
+            self.target.data.join(relative)
+        }
+    }
+
     pub async fn cancel_target(&self, sql: &str, delay: Duration) -> Result<(), String> {
         cancel_execute(self.target.port, sql, delay).await
     }

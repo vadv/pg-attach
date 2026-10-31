@@ -242,3 +242,72 @@ Feature: Transfer resilience and rollback
       """
       SELECT count(*), min(id), min(payload), min(note) FROM public.interrupted;
       """
+
+  @checksum
+  Scenario Outline: A corrupted transported page aborts the import and keeps the old table
+    Given a fresh PostgreSQL pair with checksums "<checksums>"
+    And the following SQL is executed on "source":
+      """
+      CREATE EXTENSION pg_attach;
+      CREATE TABLE public.events(id integer PRIMARY KEY, payload text);
+      INSERT INTO public.events
+      SELECT i, repeat('payload-' || i, 1000) FROM generate_series(1, 200) AS i;
+      """
+    And the following SQL is executed on "target":
+      """
+      CREATE EXTENSION pg_attach;
+      CREATE TABLE public.events(id integer PRIMARY KEY, payload text);
+      INSERT INTO public.events VALUES (0, 'kept');
+      """
+    Then the following SQL on "target" fails with "page verification failed":
+      """
+      SET pg_attach.debug_corrupt_page = 1;
+      SET pg_attach.debug_corrupt_offset = <offset>;
+      SELECT pg_attach_import(
+        'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
+        'public.events', 'public.events', true
+      );
+      """
+    And the following SQL on "target" returns "1|kept":
+      """
+      SELECT count(*), min(payload) FROM public.events;
+      """
+
+    Examples:
+      | checksums | offset |
+      | enabled   | 8190   |
+      | enabled   | 14     |
+      | disabled  | 14     |
+
+  @wal
+  Scenario: WAL full-page images reconstruct a deleted heap file
+    Given a fresh PostgreSQL pair
+    And the following SQL is executed on "source":
+      """
+      CREATE EXTENSION pg_attach;
+      CREATE TABLE public.events(id integer PRIMARY KEY, payload text, note text);
+      INSERT INTO public.events
+      SELECT i, repeat('payload-' || i, 1000), 'fpi' FROM generate_series(1, 200) AS i;
+      """
+    And the following SQL is executed on "target":
+      """
+      CREATE EXTENSION pg_attach;
+      CHECKPOINT;
+      """
+    When the following SQL is executed on "target":
+      """
+      SELECT pg_attach_import(
+        'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
+        'public.events', 'public.imported_events', true
+      );
+      """
+    And the data file path of target relation "public.imported_events" is recorded
+    And target postmaster is crashed
+    And the recorded target data file is removed
+    And target postmaster is started
+    Then the following SQL on "target" returns "200|10000|fpi":
+      """
+      SELECT count(*),
+             (SELECT length(payload) FROM public.imported_events WHERE id = 42),
+             (SELECT note FROM public.imported_events WHERE id = 42);
+      """

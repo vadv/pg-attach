@@ -348,9 +348,23 @@ pub unsafe fn import(
             return Err("page exceeds manifest relation length".into());
         }
         let target = &import.targets[relation_index];
-        if import.manifest.checksums && !Rel::verify_page(packet.block, &mut packet.bytes) {
+        // Debug-only corruption hook for the BDD suite: flips one byte of a
+        // chosen heap block to exercise page verification end to end.
+        if relation_index == 0 {
+            let block = crate::DEBUG_CORRUPT_PAGE.get();
+            let offset = crate::DEBUG_CORRUPT_OFFSET.get();
+            if block >= 0
+                && offset >= 0
+                && packet.block == u32::try_from(block).expect("nonnegative block fits u32")
+                && usize::try_from(offset).map_or(false, |offset| offset < packet.bytes.len())
+            {
+                packet.bytes[usize::try_from(offset).expect("nonnegative offset fits usize")] ^=
+                    0xFF;
+            }
+        }
+        if !Rel::verify_page(packet.block, &mut packet.bytes, import.manifest.checksums) {
             return Err(format!(
-                "checksum mismatch for block {} of relation {}",
+                "page verification failed for block {} of relation {}",
                 packet.block, relation_index
             ));
         }
