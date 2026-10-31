@@ -49,6 +49,28 @@ Feature: Core physical table transfer
       EXPLAIN (COSTS OFF) SELECT id FROM public.imported_events WHERE id = 42;
       """
 
+  @toast
+  Scenario: Mixed inline and external varlenas in one tuple keep exact values
+    When the following SQL is executed on "source":
+      """
+      INSERT INTO public.events VALUES
+        (1, repeat('payload-1', 1000), 'inline-note'),
+        (2, 'short', NULL);
+      """
+    And the following SQL is executed on "target":
+      """
+      SELECT pg_attach_import(
+        'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
+        'public.events', 'public.mixed_events', true
+      );
+      """
+    Then the following SQL on "target" returns "9000|inline-note|5":
+      """
+      SELECT (SELECT length(payload) FROM public.mixed_events WHERE id = 1)::text
+          || '|' || (SELECT note FROM public.mixed_events WHERE id = 1)
+          || '|' || (SELECT length(payload) FROM public.mixed_events WHERE id = 2)::text;
+      """
+
   Scenario: An empty table is transferred
     When the following SQL is executed on "target":
       """

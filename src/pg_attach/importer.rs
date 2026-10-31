@@ -348,7 +348,12 @@ pub unsafe fn import(
             return Err("page exceeds manifest relation length".into());
         }
         let target = &import.targets[relation_index];
-        Rel::prepare_page(packet.block, &mut packet.bytes, import.manifest.checksums);
+        if import.manifest.checksums && !Rel::verify_page(packet.block, &mut packet.bytes) {
+            return Err(format!(
+                "checksum mismatch for block {} of relation {}",
+                packet.block, relation_index
+            ));
+        }
         target.write_page(MAIN_FORK, packet.block, &packet.bytes);
         import.next_blocks[relation_index] += 1;
         Ok(())

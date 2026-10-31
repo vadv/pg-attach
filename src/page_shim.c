@@ -98,14 +98,30 @@ pg_attach_prepare_page(Page page, BlockNumber blkno, bool checksums)
     pg_attach_finish_page(page, blkno, checksums);
 }
 
+bool
+pg_attach_verify_page(Page page, BlockNumber blkno)
+{
+    uint16 stored = ((PageHeader) page)->pd_checksum;
+    bool ok;
+
+#if PG_VERSION_NUM >= 190000
+    PageSetChecksum(page, blkno);
+#else
+    PageSetChecksumInplace(page, blkno);
+#endif
+    ok = ((PageHeader) page)->pd_checksum == stored;
+    ((PageHeader) page)->pd_checksum = stored;
+    return ok;
+}
+
 void
 pg_attach_prepare_heap_page(Page page, Relation rel, BlockNumber blkno,
                             Oid source_toast_oid, Oid target_toast_oid,
                             bool patch_toast, bool checksums)
 {
     TupleDesc desc = RelationGetDescr(rel);
-    Datum *values = palloc(sizeof(Datum) * desc->natts);
-    bool *isnull = palloc(sizeof(bool) * desc->natts);
+    Datum *values = NULL;
+    bool *isnull = NULL;
     OffsetNumber offnum;
     OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
 
@@ -133,8 +149,16 @@ pg_attach_prepare_heap_page(Page page, Relation rel, BlockNumber blkno,
         HeapTupleHeaderSetXmin(header, FrozenTransactionId);
         HeapTupleHeaderSetXmax(header, InvalidTransactionId);
 
-        if (!patch_toast)
+        /* Only tuples flagged HASEXTERNAL can carry on-disk TOAST pointers:
+         * skip deformation entirely for the rest. */
+        if (!patch_toast || !(header->t_infomask & HEAP_HASEXTERNAL))
             continue;
+
+        if (values == NULL)
+        {
+            values = palloc(sizeof(Datum) * desc->natts);
+            isnull = palloc(sizeof(bool) * desc->natts);
+        }
 
         memset(&tuple, 0, sizeof(tuple));
         tuple.t_len = ItemIdGetLength(itemid);
@@ -172,8 +196,11 @@ pg_attach_prepare_heap_page(Page page, Relation rel, BlockNumber blkno,
         }
     }
 
-    pfree(values);
-    pfree(isnull);
+    if (values != NULL)
+    {
+        pfree(values);
+        pfree(isnull);
+    }
     pg_attach_finish_page(page, blkno, checksums);
 }
 
