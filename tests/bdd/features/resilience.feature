@@ -58,6 +58,33 @@ Feature: Transfer resilience and rollback
       GROUP BY c.relpersistence;
       """
 
+  @wal @slow
+  Scenario: Target crash after WAL import recovers through full-page images
+    Given a fresh PostgreSQL pair
+    And the following SQL is executed on "source":
+      """
+      CREATE EXTENSION pg_attach;
+      CREATE TABLE public.events(id integer PRIMARY KEY, payload text, note text);
+      INSERT INTO public.events SELECT i, repeat('payload', 1000), 'crash' FROM generate_series(1, 2000) AS i;
+      """
+    And the following SQL is executed on "target":
+      """
+      CREATE EXTENSION pg_attach;
+      """
+    When the following SQL is executed on "target":
+      """
+      SELECT pg_attach_import(
+        'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
+        'public.events', 'public.crashed_events', true
+      );
+      """
+    And target postmaster is crashed and restarted
+    Then the following SQL on "target" returns "2000|2000":
+      """
+      SELECT count(*)::text, count(*) FILTER (WHERE length(payload) = 7000)::text
+      FROM public.crashed_events;
+      """
+
   Scenario: Import works with data checksums enabled
     Given a fresh PostgreSQL pair with checksums "enabled"
     And the following SQL is executed on "source":

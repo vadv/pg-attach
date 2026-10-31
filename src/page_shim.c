@@ -5,6 +5,7 @@
 #include "access/htup_details.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "access/xlogrecord.h"
 #include "catalog/pg_am_d.h"
 #include "miscadmin.h"
 #include "catalog/namespace.h"
@@ -259,13 +260,57 @@ pg_attach_write_page(Relation rel, ForkNumber fork, BlockNumber blkno, const cha
                  errmsg("pg_attach: non-contiguous block %u, relation has %u blocks", blkno, blocks)));
 }
 
+/*
+ * Emit WAL full-page images for a relation whose pages were written directly
+ * through SMGR: reread them without the buffer manager and log them in
+ * batches of XLR_MAX_BLOCK_ID, the same batching core's bulk writer uses.
+ * No explicit XLogFlush: the caller commits right after, and the commit
+ * record's own WAL flush makes these earlier images durable.
+ */
 void
 pg_attach_log_relation(Relation rel, ForkNumber fork)
 {
-    BlockNumber blocks = RelationGetNumberOfBlocksInFork(rel, fork);
+    SMgrRelation smgr = RelationGetSmgr(rel);
+    BlockNumber nblocks;
+    Page       *pages;
+    BlockNumber *blknos;
+    BlockNumber blkno;
+    int         npending = 0;
+    int         i;
 
-    if (blocks > 0)
-        log_newpage_range(rel, fork, 0, blocks, fork == MAIN_FORKNUM);
+    if (!smgrexists(smgr, fork))
+        return;
+    nblocks = smgrnblocks(smgr, fork);
+    if (nblocks == 0)
+        return;
+
+    pages = palloc(sizeof(Page) * XLR_MAX_BLOCK_ID);
+    blknos = palloc(sizeof(BlockNumber) * XLR_MAX_BLOCK_ID);
+    for (i = 0; i < XLR_MAX_BLOCK_ID; i++)
+        pages[i] = palloc(BLCKSZ);
+
+    for (blkno = 0; blkno < nblocks; blkno++)
+    {
+        CHECK_FOR_INTERRUPTS();
+        smgrread(smgr, fork, blkno, pages[npending]);
+        blknos[npending] = blkno;
+        if (++npending == XLR_MAX_BLOCK_ID)
+        {
+            log_newpages(&smgr->smgr_rlocator.locator, fork, npending,
+                         blknos, pages, fork == MAIN_FORKNUM);
+            npending = 0;
+        }
+    }
+    if (npending > 0)
+        log_newpages(&smgr->smgr_rlocator.locator, fork, npending,
+                     blknos, pages, fork == MAIN_FORKNUM);
+
+    for (i = 0; i < XLR_MAX_BLOCK_ID; i++)
+        pfree(pages[i]);
+    pfree(pages);
+    pfree(blknos);
+
+    smgrimmedsync(smgr, fork);
 }
 
 void

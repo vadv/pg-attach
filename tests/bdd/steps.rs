@@ -63,6 +63,14 @@ fn stop_source(world: &mut AttachWorld) {
         .unwrap_or_else(|error| panic!("failed to stop source PostgreSQL: {error}"));
 }
 
+#[when("target postmaster is crashed and restarted")]
+async fn crash_target(world: &mut AttachWorld) {
+    let pair = world.pair.as_ref().expect("PostgreSQL pair is not running");
+    pair.crash_target()
+        .await
+        .unwrap_or_else(|error| panic!("failed to crash and restart target: {error}"));
+}
+
 #[when("source is stopped during the following SQL on \"target\":")]
 async fn stop_source_during_import(world: &mut AttachWorld, step: &Step) {
     let sql = world.expand_sql(docstring(step));

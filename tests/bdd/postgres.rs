@@ -1,7 +1,7 @@
 use std::net::TcpListener;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::OnceLock;
 use std::time::Duration;
 use tempfile::TempDir;
@@ -89,6 +89,11 @@ impl PostgresPair {
         self.source.stop()
     }
 
+    pub async fn crash_target(&self) -> Result<(), String> {
+        self.target.crash()?;
+        self.target.restart().await
+    }
+
     pub async fn cancel_target(&self, sql: &str, delay: Duration) -> Result<(), String> {
         cancel_execute(self.target.port, sql, delay).await
     }
@@ -156,6 +161,67 @@ impl Postgres {
             ],
             true,
         )
+    }
+
+    fn crash(&self) -> Result<(), String> {
+        let pid = std::fs::read_to_string(self.data.join("postmaster.pid"))
+            .map_err(|error| error.to_string())?
+            .lines()
+            .next()
+            .unwrap_or_default()
+            .to_string();
+        run("pg_ctl", &["kill", "KILL", &pid], true)?;
+        // Wait for the postmaster to exit, then drop the stale lock file: a
+        // killed postmaster cannot clean up, and PID reuse makes the next
+        // start treat the file as a live server.
+        let pid_path = format!("/proc/{pid}");
+        for _ in 0..100 {
+            if std::fs::metadata(&pid_path).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let _ = std::fs::remove_file(self.data.join("postmaster.pid"));
+        // Same for the unix socket: killed postmasters leave both files behind.
+        let socket_dir = self
+            .data
+            .parent()
+            .unwrap_or(&self.data)
+            .to_path_buf();
+        let _ = std::fs::remove_file(socket_dir.join(format!(".s.PGSQL.{}.lock", self.port)));
+        let _ = std::fs::remove_file(socket_dir.join(format!(".s.PGSQL.{}", self.port)));
+        Ok(())
+    }
+
+    async fn restart(&self) -> Result<(), String> {
+        let socket = self
+            .data
+            .parent()
+            .unwrap_or(&self.data)
+            .to_string_lossy()
+            .into_owned();
+        let options = format!(
+            "-F -p {} -k {socket} -c listen_addresses=127.0.0.1",
+            self.port
+        );
+        let data = self.data.to_string_lossy().into_owned();
+        let log = self.log.to_string_lossy().into_owned();
+        for attempt in 1..=3 {
+            match run(
+                "pg_ctl",
+                &["-D", &data, "-l", &log, "-w", "-t", "30", "-o", &options, "start"],
+                true,
+            ) {
+                Ok(()) => return self.wait_until_ready().await,
+                // Orphaned postmaster children release shared memory asynchronously.
+                Err(error) if attempt < 3 => {
+                    eprintln!("target restart attempt {attempt} failed: {error}");
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        unreachable!()
     }
 
     async fn wait_until_ready(&self) -> Result<(), String> {
@@ -311,13 +377,15 @@ fn run(program: &str, args: &[&str], as_postgres: bool) -> Result<(), String> {
     };
     let output = command
         .args(args)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
         .output()
         .map_err(|error| format!("{program}: {error}"))?;
     if output.status.success() {
         Ok(())
     } else {
-        Err(format!("{program} failed with {}", output.status))
+        Err(format!(
+            "{program} failed with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ))
     }
 }
