@@ -356,7 +356,7 @@ pub unsafe fn import(
             if block >= 0
                 && offset >= 0
                 && packet.block == u32::try_from(block).expect("nonnegative block fits u32")
-                && usize::try_from(offset).map_or(false, |offset| offset < packet.bytes.len())
+                && usize::try_from(offset).is_ok_and(|offset| offset < packet.bytes.len())
             {
                 packet.bytes[usize::try_from(offset).expect("nonnegative offset fits usize")] ^=
                     0xFF;
