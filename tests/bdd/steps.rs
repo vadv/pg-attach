@@ -56,7 +56,7 @@ async fn create_tablespace(world: &mut AttachWorld, side: String) {
         .unwrap_or_else(|error| panic!("failed to create tablespace: {error}"));
 }
 
-#[given(expr = "the data file path of target relation {string} is recorded")]
+#[when(expr = "the data file path of target relation {string} is recorded")]
 async fn record_target_data_file(world: &mut AttachWorld, relation: String) {
     let sql = format!("SELECT pg_relation_filepath('{relation}')");
     let relative = tokio::time::timeout(Duration::from_secs(30), world.query("target", &sql))
