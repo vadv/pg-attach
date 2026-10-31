@@ -1,7 +1,7 @@
 # Epic: Rust Cucumber BDD для pg_attach
 
-Статус: план, не реализовано. Этот документ описывает отдельный эпик и не
-изменяет текущий SQL API расширения.
+Статус: реализовано 24 сценария — harness, core, destination, validation и
+resilience. Документ сохраняет исходный план эпика и не изменяет SQL API расширения.
 
 ## Цель
 
@@ -15,7 +15,8 @@
 - `tests/bdd/main.rs`, `world.rs` — Cucumber World и запуск сценариев;
 - `tests/bdd/postgres_helper.rs` — управление `initdb`/`pg_ctl` и потоковые логи;
 - `tests/bdd/features/connection.feature` — feature с docstring-конфигурацией;
-- `Cargo.toml` — `cucumber = "0.21"` и отдельный `[[test]]` с `harness = false`.
+- `tests/bdd/Cargo.toml` — отдельный crate с `cucumber = "0.21"`;
+  зависимости и lockfile не добавляются в основной crate расширения.
 
 Берём идею harness и управления процессами, но не переносим Nix, клиентские
 тулчейны или GHCR-инфраструктуру без необходимости.
@@ -36,6 +37,47 @@
 5. Низкоуровневый wire/heap/TOAST тестируется отдельными Rust unit/integration
    tests; Cucumber проверяет пользовательский сценарий и наблюдаемые последствия,
    а не дублирует каждый бинарный тест.
+6. BDD — отдельный Rust crate и отдельный Docker image. Полный изолированный
+   запуск выполняет `make bdd PG_VERSION=17`. Каждый файл harness имеет одну явную
+   задачу, без скрытых фреймворков и генераторов данных.
+
+## Feature map для согласования
+
+Это согласованный состав feature-групп. Детальные сценарии review'им в draft PR;
+реализацию harness не начинаем до подтверждения этого списка.
+
+### `transfer.feature` — core transfer
+
+- heap, внешний TOAST, NULL и готовый btree переносятся вместе;
+- пустая таблица переносится без страниц данных;
+- dropped columns сохраняют физический attribute layout;
+- повторный import в то же destination проходит как полный overwrite.
+
+### `destination.feature` — destination modes
+
+- существующая непустая destination полностью перезаписывается;
+- отсутствующая destination создаётся под другим именем;
+- auto-create восстанавливает NOT NULL, defaults, CHECK и обычные btree indexes;
+- несколько индексов и повторный import в auto-created destination работают.
+
+### `validation.feature` — validation and rollback
+
+- различие source/target attributes вызывает ошибку и rollback;
+- unfrozen source tuple отклоняется;
+- unsupported relation и non-btree index отклоняются;
+- отсутствующий source не создаёт и не изменяет destination;
+- после любой ошибки target остаётся доступным для следующего import.
+
+### `resilience.feature` — `@slow`, после стабилизации первых трёх групп
+
+- import с `generate_wal = true` и в no-WAL PoC mode;
+- checksums включены и выключены;
+- обрыв source connection во время COPY не оставляет видимых partial data;
+- отмена import на target не оставляет видимых partial data;
+- зависший source/target прерывается timeout сценария и сохраняет логи.
+
+ACL, ownership, grants и roles во всех feature остаются out of scope и не
+переносятся. Матрица одинаковых feature — PostgreSQL 16–18.
 
 ## Этапы
 
@@ -73,27 +115,26 @@
 
 ### 4. CI и удаление shell-дублирования
 
-- `docker build --build-arg PG_VERSION=N` собирает образ и extension;
-- `docker run --rm ... cargo test --test bdd` запускает сценарии в том же
-  контейнере, где находятся оба postmaster;
+- `make build` собирает основной image, а `make bdd` — отдельный BDD image;
+- один `docker run --rm` запускает сценарии в контейнере, где находятся оба
+  postmaster;
 - CI публикует логи и имеет timeout на весь сценарий;
-- после полного переноса `e2e.sh` удаляется либо остаётся только маленьким smoke
-  wrapper без собственного набора проверок.
+- параллельный `e2e.sh` со своим набором assertions удалён.
 
 ## Definition of Done
 
-- [ ] Один `docker run` поднимает ровно один тестовый контейнер; внутри него
+- [x] Один `docker run` поднимает ровно один тестовый контейнер; внутри него
       Cucumber может независимо запускать и останавливать оба postmaster.
-- [ ] Все существующие `e2e.sh`-проверки представлены feature-сценариями.
-- [ ] Данные во всех feature заданы plain SQL docstring’ами; нет шагов вида
+- [x] Все существующие `e2e.sh`-проверки представлены feature-сценариями.
+- [x] Данные во всех feature заданы plain SQL docstring’ами; нет шагов вида
       `create N rows with toast`.
-- [ ] Каждый сценарий изолирован и повторяем; failure оставляет читаемые логи.
-- [ ] Проверяются отрицательный результат и rollback, а не только успешный SQL.
-- [ ] `cargo test --test bdd` работает локально и в GitHub Actions для PG16–PG18.
-- [ ] Каждый сценарий имеет timeout; зависший postmaster не блокирует CI навсегда.
-- [ ] `cargo clippy --all-targets -- -D warnings -D clippy::pedantic` зелёный.
-- [ ] `tests/bdd/README.md` содержит команды запуска, теги и схему каталогов.
-- [ ] Shell-больше не содержит параллельного набора assertions.
+- [x] Каждый сценарий изолирован и повторяем; failure оставляет читаемые логи.
+- [x] Проверяются отрицательный результат и rollback, а не только успешный SQL.
+- [x] `make bdd` работает локально и в GitHub Actions для PG16–PG18.
+- [x] SQL-операции имеют timeout; CI job ограничен 20 минутами и сохраняет логи.
+- [x] `cargo clippy --all-targets -- -D warnings -D clippy::pedantic` зелёный.
+- [x] `tests/bdd/README.md` содержит команды запуска, теги и схему каталогов.
+- [x] Shell больше не содержит параллельного набора assertions.
 
 ## Примеры feature
 

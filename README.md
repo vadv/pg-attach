@@ -14,17 +14,25 @@ PoC PostgreSQL extension that transfers a frozen table between two PostgreSQL 16
 
 Both instances need the same extension build installed. No background worker or `shared_preload_libraries` entry is needed. The source only serves a `COPY` stream; the target pulls it through libpq.
 
-## Docker PoC
+## Build and test
 
-Requires Docker with Compose. The build compiles pgrx and may take several minutes on the first run.
+For a local build, put the desired PostgreSQL `pg_config` in `PATH` (or set `PG_CONFIG`) and select its major version:
 
 ```sh
-./e2e.sh
-# When finished:
-docker compose down -v
+make build PG_VERSION=18
+make test PG_VERSION=18
+make lint PG_VERSION=18
 ```
 
-The test creates 2,000 rows with externally stored TOAST values, freezes the source, imports to a differently named target, overwrites a non-empty target, auto-creates a differently named target, compares content, performs btree lookups, and checks rollback on a schema mismatch. The Docker build also runs the Rust unit tests and strict Clippy lints.
+The Makefile exports the resolved `pg_config` path to pgrx and rejects a version mismatch. Supported versions are PostgreSQL 16, 17 and 18.
+
+The BDD suite requires Docker and starts two isolated postmasters inside one test container:
+
+```sh
+make bdd PG_VERSION=17
+```
+
+The Gherkin scenarios cover heap pages, external TOAST, NULL, btree lookup, empty tables, dropped-column layout, full overwrite, auto-created destination constraints/defaults, repeated import with multiple indexes, incompatible layouts, invalid/missing/offline sources, non-default tablespaces and non-superuser source owners. Docker builds also run Rust unit tests and strict Clippy lints.
 
 For native debugging tools and backtrace commands, see [DEBUG.md](DEBUG.md).
 
@@ -78,4 +86,4 @@ Use `generate_wal = true` for a normal permanent table, physical replicas, PITR,
 
 `src/page_shim.c` contains PostgreSQL C macro access, frozen-tuple validation, TOAST pointer rewriting, page checksum/LSN handling, SMGR writes and WAL/fsync calls. `src/pg_attach/wire.rs` is a bounded big-endian packet/schema codec with unit tests. `src/pg_attach/exporter.rs` emits schema metadata and one COPY bytea value per packet; `src/pg_attach/importer.rs` optionally creates the target, validates the manifest and installs pages sequentially. No staging files are created.
 
-See `docs/roadmap.md` for the PG16–PG18 matrix, future index/case DoD and C-boundary plan. See `docs/bdd-epic.md` for the planned Rust/Cucumber BDD epic with plain SQL docstrings and two postmasters in one test container.
+See `docs/roadmap.md` for the PG16–PG18 matrix, future index/case DoD and C-boundary plan. The implemented Rust/Cucumber BDD suite lives in `tests/bdd`; its scenarios use plain SQL docstrings and two postmasters in one test container. See `docs/bdd-epic.md` for the original planning epic.

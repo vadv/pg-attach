@@ -155,8 +155,12 @@ fn prepare_state(
     if manifest.checksums != ffi::data_checksums_enabled() {
         return Err("manifest checksum setting differs from target".into());
     }
-    if manifest.attributes != attributes(&target_main) {
-        return Err("source and target table attributes differ".into());
+    let target_attributes = attributes(&target_main);
+    if manifest.attributes != target_attributes {
+        return Err(format!(
+            "source and target table attributes differ: source={:?}, target={:?}",
+            manifest.attributes, target_attributes
+        ));
     }
 
     let source_has_toast = manifest
