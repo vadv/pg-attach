@@ -69,15 +69,75 @@ async fn stop_source_during_import(world: &mut AttachWorld, step: &Step) {
     let pair = world.pair.as_ref().expect("PostgreSQL pair is not running");
     let import = pair.execute("target", &sql);
     tokio::pin!(import);
-    tokio::select! {
-        result = &mut import => panic!("import finished before source shutdown: {result:?}"),
-        () = tokio::time::sleep(Duration::from_millis(1)) => {
-            pair.stop_source()
-                .unwrap_or_else(|error| panic!("failed to stop source PostgreSQL: {error}"));
-            let error = import.await.expect_err("import succeeded despite source shutdown");
-            eprintln!("source disconnect import error: {error}");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "source COPY did not start"
+        );
+        let check = pair.query(
+            "source",
+            "SELECT count(*)::text FROM pg_stat_activity \
+             WHERE state = 'active' AND query LIKE 'COPY (SELECT pg_attach_export_stream(%'",
+        );
+        tokio::pin!(check);
+        let result = tokio::select! {
+            result = &mut import => panic!("import finished before source shutdown: {result:?}"),
+            result = &mut check => result.unwrap_or_else(|error| panic!("COPY query failed: {error}")),
+        };
+        if result == "1" {
+            break;
         }
     }
+    pair.stop_source()
+        .unwrap_or_else(|error| panic!("failed to stop source PostgreSQL: {error}"));
+    let error = import
+        .await
+        .expect_err("import succeeded despite source shutdown");
+    eprintln!("source disconnect import error: {error}");
+}
+
+#[when("a source writer is blocked during the following SQL on \"target\":")]
+async fn source_writer_is_blocked(world: &mut AttachWorld, step: &Step) {
+    let sql = world.expand_sql(docstring(step));
+    let pair = world.pair.as_ref().expect("PostgreSQL pair is not running");
+    let import = pair.execute("target", &sql);
+    tokio::pin!(import);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "source import did not acquire AccessExclusiveLock"
+        );
+        let check = pair.query(
+            "source",
+            "SELECT count(*)::text FROM pg_locks l JOIN pg_class c ON c.oid = l.relation JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = 'events' AND l.mode = 'AccessExclusiveLock' AND l.granted",
+        );
+        tokio::pin!(check);
+        let result = tokio::select! {
+            result = &mut import => panic!("import finished before lock was observed: {result:?}"),
+            result = &mut check => result.unwrap_or_else(|error| panic!("lock query failed: {error}")),
+        };
+        if result == "1" {
+            break;
+        }
+    }
+    let writer = pair.execute(
+        "source",
+        "INSERT INTO public.events VALUES (20001, encode(gen_random_bytes(1000), 'hex'), 'writer')",
+    );
+    tokio::pin!(writer);
+    tokio::select! {
+        result = &mut import => panic!("import finished before writer block check: {result:?}"),
+        result = &mut writer => panic!("source writer was not blocked: {result:?}"),
+        () = tokio::time::sleep(Duration::from_millis(50)) => {}
+    }
+    import
+        .await
+        .unwrap_or_else(|error| panic!("direct import failed: {error}"));
+    writer
+        .await
+        .unwrap_or_else(|error| panic!("blocked source writer failed: {error}"));
 }
 
 #[when("the following SQL on \"target\" is cancelled:")]

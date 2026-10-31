@@ -22,10 +22,6 @@ Feature: Transfer validation and failure isolation
       """
       INSERT INTO public.events VALUES (1, 'source', 'new');
       """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
-      """
     And the following SQL is executed on "target":
       """
       CREATE TABLE public.events (
@@ -35,7 +31,7 @@ Feature: Transfer validation and failure isolation
       );
       INSERT INTO public.events VALUES (99, 'stale', 'old');
       """
-    And the following SQL on "target" fails with "incompatible source/target attributes":
+    Then the following SQL on "target" fails with "source and target table attributes differ":
       """
       SELECT pg_attach_import(
         'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
@@ -57,7 +53,7 @@ Feature: Transfer validation and failure isolation
       );
       INSERT INTO public.events VALUES (42, 'keep', 'old');
       """
-    And the following SQL on "target" fails with "does not exist":
+    Then the following SQL on "target" fails with "does not exist":
       """
       SELECT pg_attach_import(
         'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
@@ -79,7 +75,7 @@ Feature: Transfer validation and failure isolation
       );
       INSERT INTO public.events VALUES (42, 'keep', 'old');
       """
-    And the following SQL on "target" fails with "invalid qualified relation name":
+    Then the following SQL on "target" fails with "not a valid identifier":
       """
       SELECT pg_attach_import(
         'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
@@ -96,10 +92,6 @@ Feature: Transfer validation and failure isolation
       """
       INSERT INTO public.events VALUES (1, 'source', 'new');
       """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
-      """
     And the following SQL is executed on "target":
       """
       CREATE TABLE public.events (
@@ -109,7 +101,7 @@ Feature: Transfer validation and failure isolation
       );
       INSERT INTO public.events VALUES (42, 'keep', 'old');
       """
-    And the following SQL on "target" fails with "invalid qualified relation name":
+    Then the following SQL on "target" fails with "invalid name syntax":
       """
       SELECT pg_attach_import(
         'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
@@ -128,11 +120,8 @@ Feature: Transfer validation and failure isolation
       INSERT INTO public.events VALUES (1, 'from tablespace', 'owner');
       ALTER TABLE public.events SET TABLESPACE attach_space;
       CREATE ROLE attach_owner LOGIN;
+      GRANT pg_checkpoint TO attach_owner;
       ALTER TABLE public.events OWNER TO attach_owner;
-      """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
       """
     And the following SQL is executed on "target":
       """
@@ -146,10 +135,10 @@ Feature: Transfer validation and failure isolation
       SELECT count(*), min(payload), min(note) FROM public.events_copy;
       """
 
-  Scenario: Unfrozen source tuple rolls back and can be retried
+  Scenario: Import freezes unfrozen source tuples automatically
     When the following SQL is executed on "source":
       """
-      INSERT INTO public.events VALUES (1, 'frozen later', 'new');
+      INSERT INTO public.events VALUES (1, 'frozen by import', 'new');
       """
     And the following SQL is executed on "target":
       """
@@ -160,21 +149,6 @@ Feature: Transfer validation and failure isolation
       );
       INSERT INTO public.events VALUES (42, 'keep', 'old');
       """
-    And the following SQL on "target" fails with "contains a tuple that is not frozen":
-      """
-      SELECT pg_attach_import(
-        'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
-        'public.events', 'public.events', true
-      );
-      """
-    Then the following SQL on "target" returns "1|42|keep":
-      """
-      SELECT count(*), min(id), min(payload) FROM public.events;
-      """
-    When the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
-      """
     And the following SQL is executed on "target":
       """
       SELECT pg_attach_import(
@@ -182,7 +156,11 @@ Feature: Transfer validation and failure isolation
         'public.events', 'public.events', true
       );
       """
-    Then the following SQL on "target" returns "1|1|frozen later":
+    Then the following SQL on "source" returns "t":
+      """
+      SELECT pg_attach_source_is_frozen('public.events');
+      """
+    Then the following SQL on "target" returns "1|1|frozen by import":
       """
       SELECT count(*), min(id), min(payload) FROM public.events;
       """
@@ -201,7 +179,7 @@ Feature: Transfer validation and failure isolation
       );
       INSERT INTO public.events VALUES (42, 'keep', 'old');
       """
-    And the following SQL on "target" fails with "source must be a plain logged table":
+    Then the following SQL on "target" fails with "source must be a plain logged table":
       """
       SELECT pg_attach_import(
         'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
@@ -227,7 +205,7 @@ Feature: Transfer validation and failure isolation
       );
       INSERT INTO public.events VALUES (42, 'keep', 'old');
       """
-    And the following SQL on "target" fails with "is not a btree":
+    Then the following SQL on "target" fails with "is not a btree":
       """
       SELECT pg_attach_import(
         'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
@@ -249,8 +227,8 @@ Feature: Transfer validation and failure isolation
       );
       INSERT INTO public.events VALUES (42, 'keep', 'old');
       """
-    And source PostgreSQL is stopped
-    And the following SQL on "target" fails with "error connecting to server":
+    Given source PostgreSQL is stopped
+    Then the following SQL on "target" fails with "Connection refused":
       """
       SELECT pg_attach_import(
         'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',

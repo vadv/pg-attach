@@ -9,10 +9,6 @@ Feature: Transfer resilience and rollback
       CREATE TABLE public.events(id integer PRIMARY KEY, payload text, note text);
       INSERT INTO public.events SELECT i, repeat('payload', 1000), 'wal' FROM generate_series(1, 100) AS i;
       """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
-      """
     And the following SQL is executed on "target":
       """
       CREATE EXTENSION pg_attach;
@@ -43,10 +39,6 @@ Feature: Transfer resilience and rollback
       CREATE TABLE public.events(id integer PRIMARY KEY, payload text, note text);
       INSERT INTO public.events SELECT i, repeat('payload', 1000), 'nowal' FROM generate_series(1, 100) AS i;
       """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
-      """
     And the following SQL is executed on "target":
       """
       CREATE EXTENSION pg_attach;
@@ -74,10 +66,6 @@ Feature: Transfer resilience and rollback
       CREATE TABLE public.events(id integer PRIMARY KEY, payload text, note text);
       INSERT INTO public.events VALUES (1, repeat('checksum', 1000), 'on');
       """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
-      """
     And the following SQL is executed on "target":
       """
       CREATE EXTENSION pg_attach;
@@ -101,10 +89,6 @@ Feature: Transfer resilience and rollback
       CREATE EXTENSION pg_attach;
       CREATE TABLE public.events(id integer PRIMARY KEY, payload text, note text);
       INSERT INTO public.events VALUES (1, repeat('checksum', 1000), 'off');
-      """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
       """
     And the following SQL is executed on "target":
       """
@@ -156,10 +140,6 @@ Feature: Transfer resilience and rollback
       CREATE TABLE public.events(id integer PRIMARY KEY, payload text, note text);
       INSERT INTO public.events SELECT i, encode(gen_random_bytes(1000), 'hex'), 'new' FROM generate_series(1, 20000) AS i;
       """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
-      """
     And the following SQL is executed on "target":
       """
       CREATE EXTENSION pg_attach;
@@ -179,6 +159,36 @@ Feature: Transfer resilience and rollback
       """
 
   @slow
+  Scenario: Direct reader holds the source lock against a concurrent writer
+    Given a fresh PostgreSQL pair
+    And the following SQL is executed on "source":
+      """
+      CREATE EXTENSION pg_attach;
+      CREATE EXTENSION pgcrypto;
+      CREATE TABLE public.events(id integer PRIMARY KEY, payload text, note text);
+      INSERT INTO public.events SELECT i, encode(gen_random_bytes(1000), 'hex'), 'original' FROM generate_series(1, 20000) AS i;
+      """
+    And the following SQL is executed on "target":
+      """
+      CREATE EXTENSION pg_attach;
+      CREATE TABLE public.events(id integer PRIMARY KEY, payload text, note text);
+      """
+    When a source writer is blocked during the following SQL on "target":
+      """
+      SELECT pg_attach_import(
+        'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
+        'public.events', 'public.events', true
+      );
+      """
+    Then the following SQL on "source" returns "20001":
+      """
+      SELECT count(*)::text FROM public.events;
+      """
+    And the following SQL on "target" returns "20000|0":
+      """
+      SELECT count(*)::text, count(*) FILTER (WHERE id = 20001)::text FROM public.events;
+      """
+
   Scenario: Target cancellation leaves destination unchanged
     Given a fresh PostgreSQL pair
     And the following SQL is executed on "source":
@@ -187,10 +197,6 @@ Feature: Transfer resilience and rollback
       CREATE EXTENSION pgcrypto;
       CREATE TABLE public.events(id integer PRIMARY KEY, payload text, note text);
       INSERT INTO public.events SELECT i, encode(gen_random_bytes(1000), 'hex'), 'new' FROM generate_series(1, 20000) AS i;
-      """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
       """
     And the following SQL is executed on "target":
       """

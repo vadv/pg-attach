@@ -26,10 +26,6 @@ Feature: Core physical table transfer
              CASE WHEN i % 2 = 0 THEN 'even' END
       FROM generate_series(1, 2000) AS i;
       """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
-      """
     And the following SQL is executed on "target":
       """
       SELECT pg_attach_import(
@@ -54,11 +50,7 @@ Feature: Core physical table transfer
       """
 
   Scenario: An empty table is transferred
-    When the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
-      """
-    And the following SQL is executed on "target":
+    When the following SQL is executed on "target":
       """
       SELECT pg_attach_import(
         'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
@@ -77,10 +69,6 @@ Feature: Core physical table transfer
       INSERT INTO public.events VALUES (1, repeat('x', 12000), 'kept', 'drop me');
       ALTER TABLE public.events DROP COLUMN obsolete;
       """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
-      """
     And the following SQL is executed on "target":
       """
       SELECT pg_attach_import(
@@ -98,10 +86,6 @@ Feature: Core physical table transfer
       """
       INSERT INTO public.events VALUES (1, repeat('x', 12000), 'old');
       """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
-      """
     And the following SQL is executed on "target":
       """
       SELECT pg_attach_import(
@@ -113,10 +97,6 @@ Feature: Core physical table transfer
       """
       TRUNCATE public.events;
       INSERT INTO public.events VALUES (2, repeat('y', 12000), 'new');
-      """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
       """
     And the following SQL is executed on "target":
       """

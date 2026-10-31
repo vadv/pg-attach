@@ -226,6 +226,7 @@ pub unsafe fn import(
     generate_wal: bool,
 ) -> Result<(), String> {
     let mut source = SourceClient::connect(source_conninfo)?;
+    source.prepare_direct(source_table)?;
     let target_oid = if let Ok(oid) = ffi::resolve_relation(target_table) {
         oid
     } else {
@@ -357,5 +358,6 @@ pub unsafe fn import(
     if !state.done {
         return Err("source COPY ended without pg_attach terminator".into());
     }
+    source.commit()?;
     Ok(())
 }

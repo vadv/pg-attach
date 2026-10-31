@@ -30,6 +30,27 @@ pub mod pg_attach {
         }
     }
 
+    /// Lock a source table for a direct-read transfer in the current transaction.
+    ///
+    /// # Panics
+    /// Panics if the relation cannot be resolved or is not a plain logged table.
+    #[pg_extern]
+    pub fn pg_attach_lock_source(source_table: &str) {
+        unsafe { exporter::lock_source(source_table) }
+            .unwrap_or_else(|error| panic!("pg_attach: {error}"));
+    }
+
+    /// Check heap and TOAST tuples while ACCESS EXCLUSIVE is held, before checkpoint.
+    ///
+    /// # Panics
+    /// Panics if the relation cannot be resolved or a page cannot be read.
+    #[must_use]
+    #[pg_extern]
+    pub fn pg_attach_source_is_frozen(source_table: &str) -> bool {
+        unsafe { exporter::source_is_frozen(source_table) }
+            .unwrap_or_else(|error| panic!("pg_attach: {error}"))
+    }
+
     /// Export a compact, target-name-independent schema descriptor.
     ///
     /// # Panics

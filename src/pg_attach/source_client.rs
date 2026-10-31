@@ -9,6 +9,7 @@ enum PGresult {}
 
 const CONNECTION_OK: c_int = 0;
 const PGRES_COMMAND_OK: c_int = 1;
+const PGRES_TUPLES_OK: c_int = 2;
 const PGRES_COPY_OUT: c_int = 3;
 
 #[link(name = "pq")]
@@ -18,7 +19,19 @@ unsafe extern "C" {
     fn PQerrorMessage(conn: *const PGconn) -> *const c_char;
     fn PQfinish(conn: *mut PGconn);
     fn PQexec(conn: *mut PGconn, query: *const c_char) -> *mut PGresult;
+    fn PQexecParams(
+        conn: *mut PGconn,
+        command: *const c_char,
+        n_params: c_int,
+        param_types: *const c_void,
+        param_values: *const *const c_char,
+        param_lengths: *const c_int,
+        param_formats: *const c_int,
+        result_format: c_int,
+    ) -> *mut PGresult;
     fn PQresultStatus(result: *const PGresult) -> c_int;
+    fn PQntuples(result: *const PGresult) -> c_int;
+    fn PQgetvalue(result: *const PGresult, row: c_int, column: c_int) -> *mut c_char;
     fn PQresultErrorMessage(result: *const PGresult) -> *const c_char;
     fn PQclear(result: *mut PGresult);
     fn PQgetCopyData(conn: *mut PGconn, buffer: *mut *mut c_char, async_: c_int) -> c_int;
@@ -28,6 +41,7 @@ unsafe extern "C" {
 
 pub struct SourceClient {
     conn: *mut PGconn,
+    conninfo: String,
 }
 
 fn strip_copy_file_header(row: &[u8]) -> Result<&[u8], String> {
@@ -65,13 +79,17 @@ fn copy_binary_payload(row: &[u8]) -> Result<Option<&[u8]>, String> {
 
 impl SourceClient {
     pub fn connect(conninfo: &str) -> Result<Self, String> {
+        let conninfo_string = conninfo.to_owned();
         let conninfo =
             CString::new(conninfo).map_err(|_| "connection string contains NUL".to_owned())?;
         let conn = unsafe { PQconnectdb(conninfo.as_ptr()) };
         if conn.is_null() {
             return Err("PQconnectdb returned NULL".into());
         }
-        let client = Self { conn };
+        let client = Self {
+            conn,
+            conninfo: conninfo_string,
+        };
         if unsafe { PQstatus(conn) } != CONNECTION_OK {
             return Err(client.error());
         }
@@ -83,6 +101,123 @@ impl SourceClient {
             .to_string_lossy()
             .trim()
             .to_owned()
+    }
+
+    fn execute(&mut self, command: &str) -> Result<(), String> {
+        let command = CString::new(command).map_err(|_| "SQL command contains NUL".to_owned())?;
+        let result = unsafe { PQexec(self.conn, command.as_ptr()) };
+        if result.is_null() {
+            return Err(self.error());
+        }
+        let status = unsafe { PQresultStatus(result) };
+        let message = unsafe { CStr::from_ptr(PQresultErrorMessage(result)) }
+            .to_string_lossy()
+            .trim()
+            .to_owned();
+        unsafe { PQclear(result) };
+        if status != PGRES_COMMAND_OK && status != PGRES_TUPLES_OK {
+            return Err(if message.is_empty() {
+                self.error()
+            } else {
+                message
+            });
+        }
+        Ok(())
+    }
+
+    fn query_text(&mut self, query: &str, value: &str) -> Result<String, String> {
+        let query = CString::new(query).map_err(|_| "SQL query contains NUL".to_owned())?;
+        let value = CString::new(value).map_err(|_| "SQL parameter contains NUL".to_owned())?;
+        let value_pointer = value.as_ptr();
+        let result = unsafe {
+            PQexecParams(
+                self.conn,
+                query.as_ptr(),
+                1,
+                std::ptr::null(),
+                &raw const value_pointer,
+                std::ptr::null(),
+                std::ptr::null(),
+                0,
+            )
+        };
+        if result.is_null() {
+            return Err(self.error());
+        }
+        let status = unsafe { PQresultStatus(result) };
+        let message = unsafe { CStr::from_ptr(PQresultErrorMessage(result)) }
+            .to_string_lossy()
+            .trim()
+            .to_owned();
+        let text = if status == PGRES_TUPLES_OK && unsafe { PQntuples(result) } == 1 {
+            Ok(unsafe { CStr::from_ptr(PQgetvalue(result, 0, 0)) }
+                .to_string_lossy()
+                .into_owned())
+        } else if status == PGRES_TUPLES_OK {
+            Err("source relation does not exist".to_owned())
+        } else if message.is_empty() {
+            Err(self.error())
+        } else {
+            Err(message)
+        };
+        unsafe { PQclear(result) };
+        text
+    }
+
+    /// Freeze, lock and validate before checkpointing from a second backend.
+    /// A writer between VACUUM and LOCK causes a bounded retry before target changes.
+    pub fn prepare_direct(&mut self, source_table: &str) -> Result<(), String> {
+        // shortcut: three attempts bound writer starvation; add a policy only for production.
+        const MAX_ATTEMPTS: u8 = 3;
+        let literal = format!("'{}'", source_table.replace('\'', "''"));
+        for attempt in 1..=MAX_ATTEMPTS {
+            let vacuum = self.query_text(
+                "SELECT format('VACUUM (FREEZE) %I.%I', parts[1], parts[2]) \
+                 FROM (SELECT parse_ident($1) AS parts) AS parsed \
+                 WHERE array_length(parts, 1) = 2",
+                source_table,
+            )?;
+            self.execute(&vacuum)?;
+            self.execute("BEGIN")?;
+            let locked = self.execute(&format!("SELECT pg_attach_lock_source({literal})"));
+            if let Err(error) = locked {
+                let _ = self.execute("ROLLBACK");
+                return Err(error);
+            }
+            match self.query_text("SELECT pg_attach_source_is_frozen($1)", source_table) {
+                Ok(value) if value == "t" => {
+                    let checkpoint = Self::connect(&self.conninfo)
+                        .and_then(|mut client| client.execute("CHECKPOINT"));
+                    if let Err(error) = checkpoint {
+                        let _ = self.execute("ROLLBACK");
+                        return Err(error);
+                    }
+                    return Ok(());
+                }
+                Ok(value) if value == "f" => {
+                    self.execute("ROLLBACK")?;
+                    if attempt == MAX_ATTEMPTS {
+                        return Err(
+                            "source table did not remain frozen after 3 VACUUM FREEZE attempts"
+                                .to_owned(),
+                        );
+                    }
+                }
+                Ok(value) => {
+                    let _ = self.execute("ROLLBACK");
+                    return Err(format!("unexpected frozen validation result: {value}"));
+                }
+                Err(error) => {
+                    let _ = self.execute("ROLLBACK");
+                    return Err(error);
+                }
+            }
+        }
+        unreachable!("bounded VACUUM FREEZE loop always returns")
+    }
+
+    pub fn commit(&mut self) -> Result<(), String> {
+        self.execute("COMMIT")
     }
 
     pub fn schema(&mut self, source_table: &str) -> Result<TableSchema, String> {

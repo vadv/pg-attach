@@ -22,10 +22,6 @@ Feature: Destination table modes
       """
       INSERT INTO public.events VALUES (1, 'source', 'new');
       """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
-      """
     And the following SQL is executed on "target":
       """
       CREATE TABLE public.events (
@@ -57,10 +53,6 @@ Feature: Destination table modes
         CHECK (note IN ('even', 'odd', 'missing'));
       CREATE INDEX events_note_idx ON public.events(note);
       INSERT INTO public.events VALUES (1, 'payload', 'even');
-      """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
       """
     And the following SQL is executed on "target":
       """
@@ -100,10 +92,6 @@ Feature: Destination table modes
       CREATE INDEX events_note_idx ON public.events(note);
       INSERT INTO public.events VALUES (1, 'old payload', 'old');
       """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
-      """
     And the following SQL is executed on "target":
       """
       SELECT pg_attach_import(
@@ -115,10 +103,6 @@ Feature: Destination table modes
       """
       TRUNCATE public.events;
       INSERT INTO public.events VALUES (999, 'new payload', 'new');
-      """
-    And the following SQL is executed on "source":
-      """
-      VACUUM (FREEZE, ANALYZE) public.events;
       """
     And the following SQL is executed on "target":
       """

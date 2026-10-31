@@ -1,6 +1,6 @@
 # pg_attach
 
-PoC PostgreSQL extension that transfers a frozen table between two PostgreSQL 16–18 instances as heap, TOAST and existing btree pages. It avoids decoding/rebuilding rows and indexes. Both sides must use the same major version. PostgreSQL 19 is out of scope until its stable release.
+PoC PostgreSQL extension that freezes and transfers a table between two PostgreSQL 16–18 instances as heap, TOAST and existing btree pages. It avoids decoding/rebuilding rows and indexes. Both sides must use the same major version. PostgreSQL 19 is out of scope until its stable release.
 
 ## Scope
 
@@ -9,10 +9,10 @@ PoC PostgreSQL extension that transfers a frozen table between two PostgreSQL 16
 - An existing target is fully overwritten and must have identical attributes and btree keys; it may be non-empty and its name may differ.
 - If the target is absent, the extension creates its table/columns, supported constraints and btree indexes from a compact binary schema descriptor. The target name may differ from the source name. Automatic creation currently rejects identity columns and foreign/exclusion constraints; create such a target explicitly first.
 - ACLs, ownership, grants, roles and other privileges are deliberately out of scope and are not transferred.
-- Heap and TOAST tuples must be frozen. No VM copying; run `VACUUM (FREEZE, ANALYZE)` on the target after import.
+- Import runs `VACUUM (FREEZE)` on the source and validates frozen heap/TOAST tuples under lock. No VM copying; run `VACUUM (ANALYZE)` on the target after import.
 - No partitions, foreign tables, unlogged tables, non-btree indexes, or cross-version upgrades.
 
-Both instances need the same extension build installed. No background worker or `shared_preload_libraries` entry is needed. The source only serves a `COPY` stream; the target pulls it through libpq.
+Both instances need the same extension build installed. No background worker or `shared_preload_libraries` entry is needed. The source only serves a `COPY` stream; the target pulls it through libpq. The source role must own the table (or have equivalent VACUUM privileges) and have permission to run `CHECKPOINT` (normally a superuser or a role with `pg_checkpoint`). Heap and TOAST pages are validated under `ACCESS EXCLUSIVE` before checkpoint and are read once more for streaming; there is no separate validation pass after checkpoint.
 
 ## Build and test
 
@@ -44,12 +44,6 @@ On both databases:
 CREATE EXTENSION pg_attach;
 ```
 
-On the source, before transferring:
-
-```sql
-VACUUM (FREEZE, ANALYZE) public.events;
-```
-
 Create a compatible target table yourself, or let the extension create a missing target from the source schema, then on the target:
 
 ```sql
@@ -59,20 +53,16 @@ SELECT pg_attach_import(
   'public.events_copy',
   true                         -- generate WAL
 );
-VACUUM (FREEZE, ANALYZE) public.events_copy;
+VACUUM (ANALYZE) public.events_copy;
 ```
 
-The source export function is normally called internally, but can be inspected independently:
+`pg_attach_import` performs `VACUUM (FREEZE)` in source autocommit, then takes `ACCESS EXCLUSIVE` on that source connection and validates heap/TOAST tuples. If a writer changed the table between vacuum and lock, it rolls back and retries up to three times. `FlushRelationBuffers` makes vacuum's dirty heap/TOAST pages visible to the direct validation read without reading them through the buffer manager. Only after validation does a separate source connection run `CHECKPOINT`; the locked connection then performs direct SMGR reads and the COPY stream.
 
-```sql
-SELECT pg_attach_export_stream(
-  'public.events', 'public.events_copy',
-  '12345'::oid,                  -- target TOAST OID
-  false                          -- target data_checksums
-);
-```
+The source export function is internal to the transfer; use `pg_attach_import` rather than calling it standalone.
 
-The source takes `ShareLock` on the table, TOAST relation and indexes for the statement, blocking ordinary writes. The target takes `AccessExclusiveLock` and imports in one transaction. Existing target storage is replaced with new relfilenumbers; a missing target is created in the same transaction, so failure rolls back both creation and import. This is full overwrite, not a merge. Existing targets still require identical attributes and btree definitions; unexpected extra indexes are rejected rather than silently dropped.
+`VM_ALL_FROZEN` is available in PostgreSQL 16–18, but it is a per-heap-page visibility-map bit, not a relation-wide guarantee. It may later let the importer skip frozen-tuple validation on marked pages. It does **not** prove that the latest page version has reached disk, so it does not remove `FlushRelationBuffers` or `CHECKPOINT`. The current implementation does not use this optimization yet: heap and TOAST are read once for validation and once for streaming; eliminating that repeated work is tracked in the roadmap.
+
+The target takes `AccessExclusiveLock` and imports in one transaction. Existing target storage is replaced with new relfilenumbers; a missing target is created in the same transaction, so failure rolls back both creation and import. This is full overwrite, not a merge. Existing targets still require identical attributes and btree definitions; unexpected extra indexes are rejected rather than silently dropped.
 
 For a missing target, `pg_attach_export_schema` returns a compact binary descriptor over the same COPY transport. It contains type/default/constraint/index metadata, not a `pg_dump` invocation or PL/pgSQL. Target-side Rust quotes the requested destination name independently of the source name.
 
@@ -84,6 +74,6 @@ Use `generate_wal = true` for a normal permanent table, physical replicas, PITR,
 
 ## Implementation notes
 
-`src/page_shim.c` contains PostgreSQL C macro access, frozen-tuple validation, TOAST pointer rewriting, page checksum/LSN handling, SMGR writes and WAL/fsync calls. `src/pg_attach/wire.rs` is a bounded big-endian packet/schema codec with unit tests. `src/pg_attach/exporter.rs` emits schema metadata and one COPY bytea value per packet; `src/pg_attach/importer.rs` optionally creates the target, validates the manifest and installs pages sequentially. No staging files are created.
+`src/page_shim.c` contains PostgreSQL C macro access, relation-buffer flushing, frozen-tuple validation, direct SMGR reads, TOAST pointer rewriting, page checksum/LSN handling, SMGR writes and WAL/fsync calls. `src/pg_attach/wire.rs` is a bounded big-endian packet/schema codec with unit tests. `src/pg_attach/exporter.rs` emits schema metadata and one COPY bytea value per packet; `src/pg_attach/importer.rs` optionally creates the target, validates the manifest and installs pages sequentially. No staging files are created.
 
 See `docs/roadmap.md` for the PG16–PG18 matrix, future index/case DoD and C-boundary plan. The implemented Rust/Cucumber BDD suite lives in `tests/bdd`; its scenarios use plain SQL docstrings and two postmasters in one test container. See `docs/bdd-epic.md` for the original planning epic.

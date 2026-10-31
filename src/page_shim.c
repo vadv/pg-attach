@@ -37,13 +37,43 @@ pg_attach_resolve_relation(const char *name)
 }
 
 void
+pg_attach_flush_relation(Relation rel)
+{
+    FlushRelationBuffers(rel);
+}
+
+/* Streaming reads require table lock/checkpoint; validation uses lock/relation flush. */
+void
 pg_attach_read_page(Relation rel, ForkNumber fork, BlockNumber blkno, char *dst)
 {
-    Buffer buffer = ReadBufferExtended(rel, fork, blkno, RBM_NORMAL, NULL);
+    SMgrRelation smgr = RelationGetSmgr(rel);
 
-    LockBuffer(buffer, BUFFER_LOCK_SHARE);
-    memcpy(dst, BufferGetPage(buffer), BLCKSZ);
-    UnlockReleaseBuffer(buffer);
+    if (!smgrexists(smgr, fork))
+        elog(ERROR, "pg_attach: relation fork %d does not exist", fork);
+    smgrread(smgr, fork, blkno, dst);
+}
+
+bool
+pg_attach_heap_page_is_frozen(Page page)
+{
+    OffsetNumber offnum;
+    OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
+
+    for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum++)
+    {
+        ItemId itemid;
+        HeapTupleHeader header;
+
+        CHECK_FOR_INTERRUPTS();
+        itemid = PageGetItemId(page, offnum);
+        if (!ItemIdIsNormal(itemid))
+            continue;
+        header = (HeapTupleHeader) PageGetItem(page, itemid);
+        if (!HeapTupleHeaderXminFrozen(header) ||
+            !(header->t_infomask & HEAP_XMAX_INVALID))
+            return false;
+    }
+    return true;
 }
 
 static void
