@@ -1,4 +1,5 @@
 use std::net::TcpListener;
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
@@ -78,6 +79,10 @@ impl PostgresPair {
             ),
         )
         .await
+    }
+
+    pub fn source_log(&self) -> Result<String, String> {
+        std::fs::read_to_string(&self.source.log).map_err(|error| error.to_string())
     }
 
     pub fn stop_source(&self) -> Result<(), String> {
@@ -180,6 +185,9 @@ impl Drop for Postgres {
             let destination = directory.join(format!("{name}-{}.log", self.port));
             if let Err(error) = std::fs::create_dir_all(&directory)
                 .and_then(|()| std::fs::copy(&self.log, &destination).map(|_| ()))
+                .and_then(|()| {
+                    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o644))
+                })
             {
                 eprintln!("failed to preserve PostgreSQL log: {error}");
             }

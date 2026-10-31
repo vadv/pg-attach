@@ -12,7 +12,7 @@ PoC PostgreSQL extension that freezes and transfers a table between two PostgreS
 - Import runs `VACUUM (FREEZE)` on the source and validates frozen heap/TOAST tuples under lock. No VM copying; run `VACUUM (ANALYZE)` on the target after import.
 - No partitions, foreign tables, unlogged tables, non-btree indexes, or cross-version upgrades.
 
-Both instances need the same extension build installed. No background worker or `shared_preload_libraries` entry is needed. The source only serves a `COPY` stream; the target pulls it through libpq. The source role must own the table (or have equivalent VACUUM privileges) and have permission to run `CHECKPOINT` (normally a superuser or a role with `pg_checkpoint`). Heap and TOAST pages are validated under `ACCESS EXCLUSIVE` before checkpoint and are read once more for streaming; there is no separate validation pass after checkpoint.
+Both instances need the same extension build installed. No background worker or `shared_preload_libraries` entry is needed. The source only serves a `COPY` stream; the target pulls it through libpq. The source role must own the table (or have equivalent VACUUM privileges) and have permission to run `CHECKPOINT` (normally a superuser or a role with `pg_checkpoint`). Heap and TOAST are validated under `ACCESS EXCLUSIVE` before checkpoint using their visibility maps. Only pages without `ALL_FROZEN` need a validation read; all data pages are then read for streaming.
 
 ## Build and test
 
@@ -60,7 +60,9 @@ VACUUM (ANALYZE) public.events_copy;
 
 The source export function is internal to the transfer; use `pg_attach_import` rather than calling it standalone.
 
-`VM_ALL_FROZEN` is available in PostgreSQL 16–18, but it is a per-heap-page visibility-map bit, not a relation-wide guarantee. It may later let the importer skip frozen-tuple validation on marked pages. It does **not** prove that the latest page version has reached disk, so it does not remove `FlushRelationBuffers` or `CHECKPOINT`. The current implementation does not use this optimization yet: heap and TOAST are read once for validation and once for streaming; eliminating that repeated work is tracked in the roadmap.
+`VM_ALL_FROZEN` is used on PostgreSQL 16–18 for both heap and TOAST. Validation reads visibility-map metadata through PostgreSQL's buffer manager, reusing one pinned VM buffer per relation; when the bit is set, it does **not** read or scan the corresponding data page. Missing or clear bits fall back to direct page reads and tuple checks. If all bits are set, validation reads zero heap/TOAST pages and the transfer reads each data page only once, during streaming. This excludes VACUUM's own work and does not remove streaming tuple/TOAST rewriting. VM does **not** prove that dirty pages have reached disk, so `FlushRelationBuffers` and `CHECKPOINT` remain. With `log_min_messages = debug1`, per-relation validation logs report VM skips and data-page reads.
+
+Legacy raw frozen xmin from pre-9.4 `pg_upgrade` is intentionally unsupported: streaming rejects it even if VM is marked all-frozen, and the target transaction rolls back.
 
 The target takes `AccessExclusiveLock` and imports in one transaction. Existing target storage is replaced with new relfilenumbers; a missing target is created in the same transaction, so failure rolls back both creation and import. This is full overwrite, not a merge. Existing targets still require identical attributes and btree definitions; unexpected extra indexes are rejected rather than silently dropped.
 

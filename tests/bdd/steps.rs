@@ -199,6 +199,50 @@ async fn query_error(world: &mut AttachWorld, side: String, expected: String, st
     );
 }
 
+#[then(expr = "frozen validation reads {int} data pages across {int} relations")]
+fn validation_reads(world: &mut AttachWorld, expected_reads: u32, expected_relations: usize) {
+    let log = world
+        .pair
+        .as_ref()
+        .expect("PostgreSQL pair is not running")
+        .source_log()
+        .expect("cannot read source log");
+    let reads: Vec<u32> = log
+        .lines()
+        .filter(|line| line.contains("pg_attach: frozen validation "))
+        .map(|line| {
+            line.rsplit_once("data pages read=")
+                .expect("missing validation read count")
+                .1
+                .parse()
+                .expect("invalid validation read count")
+        })
+        .collect();
+    assert_eq!(
+        reads.len(),
+        expected_relations,
+        "missing validation diagnostics"
+    );
+    assert_eq!(reads.iter().sum::<u32>(), expected_reads, "{reads:?}");
+}
+
+#[then("source PostgreSQL did not crash")]
+fn source_did_not_crash(world: &mut AttachWorld) {
+    let log = world
+        .pair
+        .as_ref()
+        .expect("PostgreSQL pair is not running")
+        .source_log()
+        .expect("cannot read source log");
+    assert!(
+        !log.contains("terminated by signal")
+            && !log.contains("non-unwinding panic")
+            && !log.contains("reinitializing")
+            && !log.contains("automatic recovery in progress"),
+        "source backend crashed:\n{log}"
+    );
+}
+
 fn docstring(step: &Step) -> &str {
     step.docstring
         .as_deref()

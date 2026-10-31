@@ -249,8 +249,7 @@ pub unsafe fn export_schema(source_table: &str) -> Result<Vec<u8>, String> {
 
 struct ExportState {
     manifest: Manifest,
-    source_main: Rel,
-    relations: Vec<Rel>,
+    source_toast_oid: pg_sys::Oid,
     target_toast_oid: pg_sys::Oid,
     header_pending: bool,
     relation_index: usize,
@@ -273,20 +272,9 @@ impl ExportState {
         )?;
         let source_oid = ffi::resolve_relation(source_table)?;
         let source_main = Rel::open(source_oid, pg_sys::ShareLock.cast_signed());
-        let relations: Vec<Rel> = manifest
-            .relations
-            .iter()
-            .map(|relation| {
-                Rel::open(
-                    pg_sys::Oid::from_u32(relation.oid),
-                    pg_sys::ShareLock.cast_signed(),
-                )
-            })
-            .collect();
         Ok(Self {
             manifest,
-            source_main,
-            relations,
+            source_toast_oid: source_main.toast_oid(),
             target_toast_oid,
             header_pending: true,
             relation_index: 0,
@@ -307,7 +295,7 @@ impl ExportState {
             return None;
         }
 
-        while self.relation_index < self.relations.len() {
+        while self.relation_index < self.manifest.relations.len() {
             let metadata = &self.manifest.relations[self.relation_index];
             if self.block >= metadata.blocks {
                 self.relation_index += 1;
@@ -315,24 +303,23 @@ impl ExportState {
                 continue;
             }
 
+            // SRF cleanup may run under another ResourceOwner; close each Rel in its call.
+            let relation = unsafe {
+                Rel::open(
+                    pg_sys::Oid::from_u32(metadata.oid),
+                    pg_sys::NoLock.cast_signed(),
+                )
+            };
             let mut page = vec![0u8; PAGE_SIZE];
-            let source_toast = self.source_main.toast_oid();
-            self.relations[self.relation_index].read_page(MAIN_FORK, self.block, &mut page);
+            relation.read_page(MAIN_FORK, self.block, &mut page);
             match metadata.kind {
-                RelationKind::Main => self.source_main.prepare_heap_page(
+                RelationKind::Main | RelationKind::Toast => relation.prepare_heap_page(
                     self.block,
                     &mut page,
-                    source_toast,
+                    self.source_toast_oid,
                     self.target_toast_oid,
-                    source_toast != pg_sys::Oid::INVALID,
-                    self.manifest.checksums,
-                ),
-                RelationKind::Toast => self.relations[self.relation_index].prepare_heap_page(
-                    self.block,
-                    &mut page,
-                    source_toast,
-                    self.target_toast_oid,
-                    false,
+                    metadata.kind == RelationKind::Main
+                        && self.source_toast_oid != pg_sys::Oid::INVALID,
                     self.manifest.checksums,
                 ),
                 RelationKind::Index => {
@@ -375,13 +362,25 @@ pub unsafe fn export_stream(
 
 fn relation_is_frozen(relation: &Rel) -> bool {
     let mut page = vec![0u8; PAGE_SIZE];
-    for block in 0..relation.blocks(MAIN_FORK) {
-        relation.read_page(MAIN_FORK, block, &mut page);
-        if !Rel::heap_page_is_frozen(&page) {
-            return false;
+    let mut vm_skipped = 0u32;
+    let mut pages_read = 0u32;
+    let mut vm = relation.visibility_map();
+    let frozen = (0..relation.blocks(MAIN_FORK)).all(|block| {
+        if vm.all_frozen(block) {
+            vm_skipped += 1;
+            return true;
         }
-    }
-    true
+        relation.read_page(MAIN_FORK, block, &mut page);
+        pages_read += 1;
+        Rel::heap_page_is_frozen(&page)
+    });
+    pgrx::debug1!(
+        "pg_attach: frozen validation {}: VM skipped={}, data pages read={}",
+        relation.name(),
+        vm_skipped,
+        pages_read
+    );
+    frozen
 }
 
 /// Validate frozen heap and TOAST tuples after VACUUM and ACCESS EXCLUSIVE,
@@ -391,7 +390,7 @@ fn relation_is_frozen(relation: &Rel) -> bool {
 /// Runs inside PostgreSQL with the source relation lock held by this transaction.
 pub unsafe fn source_is_frozen(source_table: &str) -> Result<bool, String> {
     let source_oid = ffi::resolve_relation(source_table)?;
-    let source = Rel::open(source_oid, pg_sys::ShareLock.cast_signed());
+    let source = Rel::open(source_oid, pg_sys::AccessExclusiveLock.cast_signed());
     if !source.is_plain_logged_table() {
         return Err("source must be a plain logged table".into());
     }

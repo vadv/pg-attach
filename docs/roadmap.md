@@ -90,27 +90,27 @@ concurrent source writer. Для benchmark старый buffer path можно �
 
 ### Устранение повторных чтений heap/TOAST
 
-Текущая реализация на каждую попытку делает два полных прохода по heap и TOAST:
+Полный повторный validation scan после vacuum устранён для страниц с `ALL_FROZEN`:
 
 1. После `VACUUM FREEZE`, `ACCESS EXCLUSIVE` и `FlushRelationBuffers` функция
-   `pg_attach_source_is_frozen` через direct read загружает каждую страницу и
-   сканирует все tuple headers, проверяя frozen `xmin` и invalid `xmax`. При
-   неудаче importer откатывает source lock и повторяет vacuum/lock.
+   `pg_attach_source_is_frozen` проверяет VM heap и TOAST. Для страниц с
+   `ALL_FROZEN` данные не читаются; только страницы без флага загружаются через
+   direct read для проверки frozen `xmin` и invalid `xmax`. При неудаче importer
+   откатывает source lock и повторяет vacuum/lock.
 2. После `CHECKPOINT` streaming exporter снова direct-read загружает те же
    страницы. `pg_attach_prepare_heap_page` повторно проходит tuples, проверяет
    frozen state, переписывает external TOAST pointers на target TOAST OID;
    затем страница получает target LSN/checksum. Btree в validation pass не
    участвует и читается только во время stream.
 
-Это сознательный безопасный PoC, а не желаемая финальная схема. Разделение
-фаз оставляет ожидаемый `needs another freeze` в обычном bool-запросе до начала
-lazy COPY и не даёт C `ERROR` пересечь SRF callback. Цена — второй read и второй
-tuple scan; OS page cache не устраняет лишний CPU и не гарантирует отсутствие
-повторного дискового I/O на больших таблицах.
+Если все VM-флаги установлены, validation читает 0 страниц heap/TOAST; после
+vacuum остаётся один проход по данным для stream и чтение маленькой VM. Работа
+самого vacuum, flush/checkpoint и streaming tuple scan в это число не входят.
+Счётчики VM skips/data-page reads доступны на уровне DEBUG1 и проверяются BDD.
 
-Целевой вариант — один direct read heap/TOAST на попытку, который одновременно
-проверяет tuple state, переписывает TOAST pointers и отдаёт страницу в stream.
-Для этого необходимо:
+Разделение фаз оставляет `needs another freeze` в обычном bool-запросе до начала
+lazy COPY. Повторные data reads остаются только для страниц без VM-флага.
+Дальнейшее устранение даже этого fallback — отдельная задача; для неё необходимо:
 
 - перенести ожидаемый unfrozen/needs-retry результат в typed status или выделенный
   SQLSTATE/control packet, не используя substring matching и не позволяя C ERROR
@@ -124,8 +124,7 @@ tuple scan; OS page cache не устраняет лишний CPU и не га�
   проходов, поскольку нарушение lock/flush protocol не должно молча переносить
   неподдерживаемые tuples.
 
-`VM_ALL_FROZEN` — отдельная оптимизация внутри этой схемы. Макрос и vacuum skip
-существуют в PG16–PG18. Флаг per-page позволяет пропускать frozen validation на
+`VM_ALL_FROZEN` уже применяется в этой схеме на PG16–PG18. Флаг per-page позволяет пропускать frozen validation на
 помеченных heap pages, но не заменяет scan, нужный для TOAST pointer rewrite,
 и не является relation-wide доказательством. Он также не заменяет flush/checkpoint:
 visibility map не гарантирует, что последняя версия dirty page записана на disk.
@@ -135,6 +134,15 @@ I/O/CPU на больших external-TOAST таблицах, успешный re
 vacuum и lock, rollback после ошибки в середине stream, отсутствие дублей или
 partial target data, и зелёные PG16–PG18 BDD. Нельзя достигать одного прохода
 простым удалением validation или безусловным доверием VM.
+
+### Legacy frozen tuples после pg_upgrade
+
+Raw `xmin = FrozenTransactionId` без `HEAP_XMIN_FROZEN` после
+`pg_upgrade` с версий до 9.4 сознательно **не поддерживается**. VM может считать
+такую страницу all-frozen, но streaming обязан отклонить tuple и откатить target.
+Нормализовать и принимать этот формат не планируем. BDD создаёт точный legacy
+header тестовой C-библиотекой и проверяет отказ как с VM, так и без неё;
+библиотека не входит в production image.
 
 ## C boundary: принцип и план
 

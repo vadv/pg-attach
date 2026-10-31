@@ -70,6 +70,30 @@ pub fn resolve_relation(name: &str) -> Result<pg_sys::Oid, String> {
 
 pub struct Rel(pg_sys::Relation);
 
+// Stack-local: reuse one VM pin per relation and release it before returning to PostgreSQL.
+pub struct VisibilityMap<'a> {
+    relation: &'a Rel,
+    buffer: pg_sys::Buffer,
+}
+
+impl VisibilityMap<'_> {
+    pub fn all_frozen(&mut self, block: u32) -> bool {
+        pg_sys::check_for_interrupts!();
+        let status = unsafe {
+            pg_sys::visibilitymap_get_status(self.relation.0, block, &raw mut self.buffer)
+        };
+        u32::from(status) & pg_sys::VISIBILITYMAP_ALL_FROZEN != 0
+    }
+}
+
+impl Drop for VisibilityMap<'_> {
+    fn drop(&mut self) {
+        if self.buffer != pg_sys::InvalidBuffer.cast_signed() {
+            unsafe { pg_sys::ReleaseBuffer(self.buffer) }
+        }
+    }
+}
+
 impl Rel {
     /// Opens a relation and retains its lock until transaction end on Drop.
     pub unsafe fn open(oid: pg_sys::Oid, lock: pg_sys::LOCKMODE) -> Self {
@@ -157,6 +181,13 @@ impl Rel {
 
     pub fn prepare_page(block: u32, page: &mut [u8], checksums: bool) {
         unsafe { guard(|| pg_attach_prepare_page(page.as_mut_ptr().cast(), block, checksums)) }
+    }
+
+    pub fn visibility_map(&self) -> VisibilityMap<'_> {
+        VisibilityMap {
+            relation: self,
+            buffer: pg_sys::InvalidBuffer.cast_signed(),
+        }
     }
 
     pub fn heap_page_is_frozen(page: &[u8]) -> bool {
