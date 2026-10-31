@@ -19,6 +19,7 @@ pub struct RawAttribute {
 
 unsafe extern "C" {
     fn pg_attach_resolve_relation(name: *const c_char) -> pg_sys::Oid;
+    fn pg_attach_flush_relation(rel: pg_sys::Relation);
     fn pg_attach_read_page(
         rel: pg_sys::Relation,
         fork: pg_sys::ForkNumber::Type,
@@ -26,6 +27,7 @@ unsafe extern "C" {
         dst: *mut c_char,
     );
     fn pg_attach_prepare_page(page: *mut c_char, block: pg_sys::BlockNumber, checksums: bool);
+    fn pg_attach_heap_page_is_frozen(page: *const c_char) -> bool;
     fn pg_attach_prepare_heap_page(
         page: *mut c_char,
         rel: pg_sys::Relation,
@@ -50,9 +52,15 @@ unsafe extern "C" {
     fn pg_attach_sync_relation(rel: pg_sys::Relation, fork: pg_sys::ForkNumber::Type);
 }
 
+#[inline]
+unsafe fn guard<T>(f: impl FnOnce() -> T) -> T {
+    // Our hand-written C shim can raise ERROR; pgrx must catch the longjmp.
+    unsafe { pg_sys::ffi::pg_guard_ffi_boundary(f) }
+}
+
 pub fn resolve_relation(name: &str) -> Result<pg_sys::Oid, String> {
     let name = std::ffi::CString::new(name).map_err(|_| "relation name contains NUL".to_owned())?;
-    let oid = unsafe { pg_attach_resolve_relation(name.as_ptr()) };
+    let oid = unsafe { guard(|| pg_attach_resolve_relation(name.as_ptr())) };
     if oid == pg_sys::Oid::INVALID {
         Err("relation does not exist".to_owned())
     } else {
@@ -61,6 +69,30 @@ pub fn resolve_relation(name: &str) -> Result<pg_sys::Oid, String> {
 }
 
 pub struct Rel(pg_sys::Relation);
+
+// Stack-local: reuse one VM pin per relation and release it before returning to PostgreSQL.
+pub struct VisibilityMap<'a> {
+    relation: &'a Rel,
+    buffer: pg_sys::Buffer,
+}
+
+impl VisibilityMap<'_> {
+    pub fn all_frozen(&mut self, block: u32) -> bool {
+        pg_sys::check_for_interrupts!();
+        let status = unsafe {
+            pg_sys::visibilitymap_get_status(self.relation.0, block, &raw mut self.buffer)
+        };
+        u32::from(status) & pg_sys::VISIBILITYMAP_ALL_FROZEN != 0
+    }
+}
+
+impl Drop for VisibilityMap<'_> {
+    fn drop(&mut self) {
+        if self.buffer != pg_sys::InvalidBuffer.cast_signed() {
+            unsafe { pg_sys::ReleaseBuffer(self.buffer) }
+        }
+    }
+}
 
 impl Rel {
     /// Opens a relation and retains its lock until transaction end on Drop.
@@ -81,7 +113,7 @@ impl Rel {
     }
 
     pub fn toast_index_oid(&self) -> pg_sys::Oid {
-        unsafe { pg_attach_toast_index_oid(self.0) }
+        unsafe { guard(|| pg_attach_toast_index_oid(self.0)) }
     }
 
     #[allow(clippy::cast_possible_wrap)] // PostgreSQL constants are ASCII on either c_char signedness.
@@ -116,8 +148,9 @@ impl Rel {
 
     pub fn index_oids(&self) -> Vec<pg_sys::Oid> {
         let mut ptr = std::ptr::null_mut();
-        let count = usize::try_from(unsafe { pg_attach_index_oids(self.0, &raw mut ptr) })
-            .expect("index count is nonnegative");
+        let count =
+            usize::try_from(unsafe { guard(|| pg_attach_index_oids(self.0, &raw mut ptr)) })
+                .expect("index count is nonnegative");
         if count == 0 {
             Vec::new()
         } else {
@@ -126,23 +159,40 @@ impl Rel {
     }
 
     pub fn attributes(&self) -> Vec<RawAttribute> {
-        let count = usize::try_from(unsafe { pg_attach_attribute_count(self.0) })
+        let count = usize::try_from(unsafe { guard(|| pg_attach_attribute_count(self.0)) })
             .expect("attribute count is nonnegative");
         let mut attrs = Vec::with_capacity(count);
         unsafe {
-            pg_attach_attributes(self.0, attrs.as_mut_ptr());
+            let ptr = attrs.as_mut_ptr();
+            guard(|| pg_attach_attributes(self.0, ptr));
             attrs.set_len(count);
         }
         attrs
     }
 
+    pub fn flush_buffers(&self) {
+        unsafe { guard(|| pg_attach_flush_relation(self.0)) }
+    }
+
     pub fn read_page(&self, fork: pg_sys::ForkNumber::Type, block: u32, dst: &mut [u8]) {
         assert_eq!(dst.len(), PAGE_SIZE);
-        unsafe { pg_attach_read_page(self.0, fork, block, dst.as_mut_ptr().cast()) }
+        unsafe { guard(|| pg_attach_read_page(self.0, fork, block, dst.as_mut_ptr().cast())) }
     }
 
     pub fn prepare_page(block: u32, page: &mut [u8], checksums: bool) {
-        unsafe { pg_attach_prepare_page(page.as_mut_ptr().cast(), block, checksums) }
+        unsafe { guard(|| pg_attach_prepare_page(page.as_mut_ptr().cast(), block, checksums)) }
+    }
+
+    pub fn visibility_map(&self) -> VisibilityMap<'_> {
+        VisibilityMap {
+            relation: self,
+            buffer: pg_sys::InvalidBuffer.cast_signed(),
+        }
+    }
+
+    pub fn heap_page_is_frozen(page: &[u8]) -> bool {
+        assert_eq!(page.len(), PAGE_SIZE);
+        unsafe { guard(|| pg_attach_heap_page_is_frozen(page.as_ptr().cast())) }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -156,29 +206,31 @@ impl Rel {
         checksums: bool,
     ) {
         unsafe {
-            pg_attach_prepare_heap_page(
-                page.as_mut_ptr().cast(),
-                self.0,
-                block,
-                source_toast,
-                target_toast,
-                patch_toast,
-                checksums,
-            );
+            guard(|| {
+                pg_attach_prepare_heap_page(
+                    page.as_mut_ptr().cast(),
+                    self.0,
+                    block,
+                    source_toast,
+                    target_toast,
+                    patch_toast,
+                    checksums,
+                );
+            });
         }
     }
 
     pub fn write_page(&self, fork: pg_sys::ForkNumber::Type, block: u32, page: &[u8]) {
         assert_eq!(page.len(), PAGE_SIZE);
-        unsafe { pg_attach_write_page(self.0, fork, block, page.as_ptr().cast()) }
+        unsafe { guard(|| pg_attach_write_page(self.0, fork, block, page.as_ptr().cast())) }
     }
 
     pub fn log_relation(&self, fork: pg_sys::ForkNumber::Type) {
-        unsafe { pg_attach_log_relation(self.0, fork) }
+        unsafe { guard(|| pg_attach_log_relation(self.0, fork)) }
     }
 
     pub fn sync_relation(&self, fork: pg_sys::ForkNumber::Type) {
-        unsafe { pg_attach_sync_relation(self.0, fork) }
+        unsafe { guard(|| pg_attach_sync_relation(self.0, fork)) }
     }
 }
 
@@ -195,7 +247,8 @@ pub fn data_checksums_enabled() -> bool {
 }
 
 pub fn index_definition(oid: pg_sys::Oid) -> String {
-    unsafe { CStr::from_ptr(pg_attach_index_definition(oid)) }
+    let definition = unsafe { guard(|| pg_attach_index_definition(oid)) };
+    unsafe { CStr::from_ptr(definition) }
         .to_string_lossy()
         .into_owned()
 }
