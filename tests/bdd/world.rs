@@ -1,9 +1,11 @@
 use crate::postgres::PostgresPair;
 use cucumber::World;
+use std::path::PathBuf;
 
 #[derive(Debug, Default, World)]
 pub struct AttachWorld {
     pub pair: Option<PostgresPair>,
+    pub recorded_data_file: Option<PathBuf>,
 }
 
 impl AttachWorld {

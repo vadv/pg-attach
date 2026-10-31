@@ -56,11 +56,78 @@ async fn create_tablespace(world: &mut AttachWorld, side: String) {
         .unwrap_or_else(|error| panic!("failed to create tablespace: {error}"));
 }
 
+#[when(expr = "the data file path of target relation {string} is recorded")]
+async fn record_target_data_file(world: &mut AttachWorld, relation: String) {
+    let sql = format!("SELECT pg_relation_filepath('{relation}')");
+    let relative = tokio::time::timeout(Duration::from_secs(30), world.query("target", &sql))
+        .await
+        .expect("SQL query timed out")
+        .unwrap_or_else(|error| panic!("query on target failed: {error}\nSQL:\n{sql}"));
+    let pair = world.pair.as_ref().expect("PostgreSQL pair is not started");
+    world.recorded_data_file = Some(pair.target_data_path(&relative));
+}
+
+#[when("target postmaster is crashed")]
+fn crash_target_without_restart(world: &mut AttachWorld) {
+    world
+        .pair
+        .as_mut()
+        .expect("PostgreSQL pair is not started")
+        .crash_target_only()
+        .expect("failed to crash target postmaster");
+}
+
+#[when("the recorded target data file is removed")]
+fn remove_recorded_data_file(world: &mut AttachWorld) {
+    let path = world
+        .recorded_data_file
+        .clone()
+        .expect("no recorded target data file");
+    assert!(
+        path.exists(),
+        "recorded data file {} does not exist",
+        path.display()
+    );
+    std::fs::remove_file(&path)
+        .unwrap_or_else(|error| panic!("failed to remove {}: {error}", path.display()));
+    let stem = path.file_name().expect("file name").to_string_lossy().into_owned();
+    for segment in 1.. {
+        let sibling = path.with_file_name(format!("{stem}_{segment}"));
+        if !sibling.exists() {
+            break;
+        }
+        std::fs::remove_file(&sibling).unwrap_or_else(|error| {
+            panic!("failed to remove {}: {error}", sibling.display())
+        });
+    }
+}
+
+#[when("target postmaster is started")]
+async fn start_target_postmaster(world: &mut AttachWorld) {
+    let start = world
+        .pair
+        .as_mut()
+        .expect("PostgreSQL pair is not started")
+        .start_target();
+    tokio::time::timeout(Duration::from_secs(60), start)
+        .await
+        .expect("target postmaster start timed out")
+        .unwrap_or_else(|error| panic!("failed to start target: {error}"));
+}
+
 #[given("source PostgreSQL is stopped")]
 fn stop_source(world: &mut AttachWorld) {
     let pair = world.pair.as_ref().expect("PostgreSQL pair is not running");
     pair.stop_source()
         .unwrap_or_else(|error| panic!("failed to stop source PostgreSQL: {error}"));
+}
+
+#[when("target postmaster is crashed and restarted")]
+async fn crash_target(world: &mut AttachWorld) {
+    let pair = world.pair.as_ref().expect("PostgreSQL pair is not running");
+    pair.crash_target()
+        .await
+        .unwrap_or_else(|error| panic!("failed to crash and restart target: {error}"));
 }
 
 #[when("source is stopped during the following SQL on \"target\":")]

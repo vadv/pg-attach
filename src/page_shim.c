@@ -5,6 +5,7 @@
 #include "access/htup_details.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "access/xlogrecord.h"
 #include "catalog/pg_am_d.h"
 #include "miscadmin.h"
 #include "catalog/namespace.h"
@@ -97,14 +98,53 @@ pg_attach_prepare_page(Page page, BlockNumber blkno, bool checksums)
     pg_attach_finish_page(page, blkno, checksums);
 }
 
+bool
+pg_attach_verify_page(Page page, BlockNumber blkno, bool checksums)
+{
+    PageHeader phdr = (PageHeader) page;
+    uint16 stored;
+    bool ok;
+    int i;
+
+    if (PageIsNew(page))
+    {
+        /* A new page is legitimate only when entirely zeroed; the checksum
+         * setters skip such pages, so they must never pass by default. */
+        for (i = 0; i < BLCKSZ; i++)
+            if (((const char *) page)[i] != 0)
+                return false;
+        return true;
+    }
+
+    if (phdr->pd_lower < SizeOfPageHeaderData ||
+        phdr->pd_lower > phdr->pd_upper ||
+        phdr->pd_upper > phdr->pd_special ||
+        phdr->pd_special > BLCKSZ ||
+        phdr->pd_special != MAXALIGN(phdr->pd_special))
+        return false;
+
+    if (!checksums)
+        return true;
+
+    stored = phdr->pd_checksum;
+#if PG_VERSION_NUM >= 190000
+    PageSetChecksum(page, blkno);
+#else
+    PageSetChecksumInplace(page, blkno);
+#endif
+    ok = phdr->pd_checksum == stored;
+    phdr->pd_checksum = stored;
+    return ok;
+}
+
 void
 pg_attach_prepare_heap_page(Page page, Relation rel, BlockNumber blkno,
                             Oid source_toast_oid, Oid target_toast_oid,
                             bool patch_toast, bool checksums)
 {
     TupleDesc desc = RelationGetDescr(rel);
-    Datum *values = palloc(sizeof(Datum) * desc->natts);
-    bool *isnull = palloc(sizeof(bool) * desc->natts);
+    Datum *values = NULL;
+    bool *isnull = NULL;
     OffsetNumber offnum;
     OffsetNumber maxoff = PageGetMaxOffsetNumber(page);
 
@@ -132,8 +172,16 @@ pg_attach_prepare_heap_page(Page page, Relation rel, BlockNumber blkno,
         HeapTupleHeaderSetXmin(header, FrozenTransactionId);
         HeapTupleHeaderSetXmax(header, InvalidTransactionId);
 
-        if (!patch_toast)
+        /* Only tuples flagged HASEXTERNAL can carry on-disk TOAST pointers:
+         * skip deformation entirely for the rest. */
+        if (!patch_toast || !(header->t_infomask & HEAP_HASEXTERNAL))
             continue;
+
+        if (values == NULL)
+        {
+            values = palloc(sizeof(Datum) * desc->natts);
+            isnull = palloc(sizeof(bool) * desc->natts);
+        }
 
         memset(&tuple, 0, sizeof(tuple));
         tuple.t_len = ItemIdGetLength(itemid);
@@ -171,8 +219,11 @@ pg_attach_prepare_heap_page(Page page, Relation rel, BlockNumber blkno,
         }
     }
 
-    pfree(values);
-    pfree(isnull);
+    if (values != NULL)
+    {
+        pfree(values);
+        pfree(isnull);
+    }
     pg_attach_finish_page(page, blkno, checksums);
 }
 
@@ -259,13 +310,57 @@ pg_attach_write_page(Relation rel, ForkNumber fork, BlockNumber blkno, const cha
                  errmsg("pg_attach: non-contiguous block %u, relation has %u blocks", blkno, blocks)));
 }
 
+/*
+ * Emit WAL full-page images for a relation whose pages were written directly
+ * through SMGR: reread them without the buffer manager and log them in
+ * batches of XLR_MAX_BLOCK_ID, the same batching core's bulk writer uses.
+ * No explicit XLogFlush: the caller commits right after, and the commit
+ * record's own WAL flush makes these earlier images durable.
+ */
 void
 pg_attach_log_relation(Relation rel, ForkNumber fork)
 {
-    BlockNumber blocks = RelationGetNumberOfBlocksInFork(rel, fork);
+    SMgrRelation smgr = RelationGetSmgr(rel);
+    BlockNumber nblocks;
+    Page       *pages;
+    BlockNumber *blknos;
+    BlockNumber blkno;
+    int         npending = 0;
+    int         i;
 
-    if (blocks > 0)
-        log_newpage_range(rel, fork, 0, blocks, fork == MAIN_FORKNUM);
+    if (!smgrexists(smgr, fork))
+        return;
+    nblocks = smgrnblocks(smgr, fork);
+    if (nblocks == 0)
+        return;
+
+    pages = palloc(sizeof(Page) * XLR_MAX_BLOCK_ID);
+    blknos = palloc(sizeof(BlockNumber) * XLR_MAX_BLOCK_ID);
+    for (i = 0; i < XLR_MAX_BLOCK_ID; i++)
+        pages[i] = palloc(BLCKSZ);
+
+    for (blkno = 0; blkno < nblocks; blkno++)
+    {
+        CHECK_FOR_INTERRUPTS();
+        smgrread(smgr, fork, blkno, pages[npending]);
+        blknos[npending] = blkno;
+        if (++npending == XLR_MAX_BLOCK_ID)
+        {
+            log_newpages(&smgr->smgr_rlocator.locator, fork, npending,
+                         blknos, pages, fork == MAIN_FORKNUM);
+            npending = 0;
+        }
+    }
+    if (npending > 0)
+        log_newpages(&smgr->smgr_rlocator.locator, fork, npending,
+                     blknos, pages, fork == MAIN_FORKNUM);
+
+    for (i = 0; i < XLR_MAX_BLOCK_ID; i++)
+        pfree(pages[i]);
+    pfree(pages);
+    pfree(blknos);
+
+    smgrimmedsync(smgr, fork);
 }
 
 void
