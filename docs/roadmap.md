@@ -43,6 +43,49 @@ PostgreSQL 16, 17, 18 и 19. Это не cross-version physical upgrade: page la
 Для каждого AM сначала записываются page invariants и rollback/recovery story,
 затем реализуется один узкий happy path и только после этого расширяется matrix.
 
+## Следующая итерация после BDD: direct disk read
+
+После завершения текущего BDD-набора исследуем замену чтения source через
+buffer manager на прямое чтение relation files. Причина — не предполагаемый
+выигрыш page-level buffer lock: при удерживаемом `ACCESS EXCLUSIVE` обычные
+писатели уже заблокированы. Производительность direct I/O нужно измерить
+отдельно; переход не считается заранее более быстрым.
+
+Базовый протокол: `VACUUM FREEZE → LOCK → CHECKPOINT → READ`.
+
+1. Выполнить `VACUUM (FREEZE) table` в autocommit. Vacuum не блокирует DML.
+2. В connection A выполнить `BEGIN` и `LOCK TABLE table IN ACCESS EXCLUSIVE
+   MODE`; удерживать lock до конца чтения.
+3. **После получения lock** повторно проверить heap и TOAST: все tuples frozen,
+   нет действующего `xmax` или других неподдерживаемых состояний. При неудаче
+   откатить lock и повторить vacuum, а не помечать tuples frozen принудительно.
+4. В connection B выполнить `CHECKPOINT` и дождаться его завершения.
+5. В connection A читать heap, TOAST и поддерживаемые btree напрямую с диска,
+   включая все relation segments и необходимые forks, затем завершить
+   транзакцию и снять lock.
+
+Гонки и ограничения протокола явно входят в реализацию:
+
+- между `VACUUM FREEZE` и `LOCK TABLE` возможен DML; поэтому обязательна
+  проверка frozen state именно после lock, с abort/retry;
+- между checkpoint и чтением не должно быть окна до lock: checkpoint выполняем
+  только после `ACCESS EXCLUSIVE`, иначе dirty pages могут появиться снова;
+- `LOCK TABLE` сам не сбрасывает shared buffers; без checkpoint или адресного
+  flush прямой `pread()` может прочитать устаревшую страницу;
+- `VACUUM` и `CHECKPOINT` нельзя выполнить внутри transaction block/SQL
+  function, а table lock живёт до конца транзакции. Поэтому одна SQL-функция
+  `lock + vacuum + checkpoint + read` не подходит: нужен внешний orchestration
+  с двумя подключениями либо отдельно спроектированный background worker;
+- checkpoint затрагивает весь кластер и может быть дорогим. Для PoC это
+  допустимо; затем исследовать адресный flush heap/TOAST/index relations;
+- прямое чтение обязано учитывать tablespace, relfilenode, сегменты и forks,
+  а не открывать только один путь из `pg_relation_filepath()`.
+
+До реализации завершить BDD matrix и CI. В новой итерации сначала добавить
+race/rollback BDD-сценарии и benchmark buffer manager против direct read, затем
+менять per-page path. Текущий checked-in SMGR/buffer-manager reader остаётся
+рабочим до доказательства корректности замены.
+
 ## C boundary: принцип и план
 
 C оставляем только там, где он даёт проверяемую пользу: PostgreSQL macros в
