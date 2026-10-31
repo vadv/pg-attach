@@ -309,5 +309,6 @@ Feature: Transfer resilience and rollback
       """
       SELECT count(*),
              (SELECT length(payload) FROM public.imported_events WHERE id = 42),
-             (SELECT note FROM public.imported_events WHERE id = 42);
+             (SELECT note FROM public.imported_events WHERE id = 42)
+      FROM public.imported_events;
       """
