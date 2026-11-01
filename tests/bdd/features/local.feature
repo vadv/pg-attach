@@ -2,6 +2,13 @@ Feature: Local table clone inside a single database
   The same-page pipeline as the cross-instance import, but without libpq:
   pg_attach_import_local clones a frozen table under one postmaster.
 
+  Background:
+    Given a fresh PostgreSQL pair
+    And the following SQL is executed on "target":
+      """
+      CREATE EXTENSION pg_attach;
+      """
+
   @local
   Scenario: Local clone transfers TOAST and btree pages
     Given the following SQL is executed on "target":
