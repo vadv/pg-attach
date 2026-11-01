@@ -1,7 +1,6 @@
 use super::exporter;
 use super::ffi::{self, Rel, MAIN_FORK};
 use super::source_client::SourceClient;
-use super::source_client::SourceClient;
 use super::wire::{self, Manifest, RelationKind, TableSchema};
 use pgrx::pg_sys;
 use pgrx::spi::Spi;
