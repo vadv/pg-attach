@@ -109,4 +109,16 @@ pub mod pg_attach {
                 .unwrap_or_else(|error| panic!("pg_attach: {error}"));
         }
     }
+
+    /// Clone a frozen table inside the current database with no client transport.
+    ///
+    /// # Panics
+    /// Panics if freezing validation, target creation or page installation fails.
+    #[pg_extern]
+    pub fn pg_attach_import_local(source_table: &str, target_table: &str, generate_wal: bool) {
+        unsafe {
+            importer::import_local(source_table, target_table, generate_wal)
+                .unwrap_or_else(|error| panic!("pg_attach: {error}"));
+        }
+    }
 }
