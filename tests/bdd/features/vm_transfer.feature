@@ -84,3 +84,42 @@ Feature: VM fast path preserves physical transfer across storage modes
       SET enable_seqscan = off;
       SELECT payload = repeat('old', 2000) FROM public.events_copy WHERE id = 3;
       """
+
+  Scenario: Visibility map and free space map pages transfer with the heap
+    Given a fresh PostgreSQL pair
+    And the following SQL is executed on "source":
+      """
+      CREATE EXTENSION pg_attach;
+      CREATE EXTENSION pg_freespacemap;
+      CREATE TABLE public.events(id integer PRIMARY KEY, payload text);
+      INSERT INTO public.events SELECT i, repeat('v', 700) FROM generate_series(1, 2000) AS i;
+      """
+    And the following SQL is executed on "target":
+      """
+      CREATE EXTENSION pg_attach;
+      CREATE EXTENSION pg_visibility;
+      CREATE EXTENSION pg_freespacemap;
+      """
+    When the following SQL is executed on "target":
+      """
+      SELECT pg_attach_import(
+        'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
+        'public.events', 'public.events_copy', true
+      );
+      """
+    Then the following SQL on "target" returns "0":
+      """
+      SELECT count(*)
+      FROM pg_visibility('public.events_copy')
+      WHERE NOT all_visible OR NOT all_frozen;
+      """
+    And the following SQL on "source" returns "aa34077a4b2804c9c3ebbc97ad81d442":
+      """
+      SELECT coalesce(md5(string_agg(blkno || ':' || avail, ',' ORDER BY blkno)), 'empty')
+      FROM pg_freespace('public.events');
+      """
+    And the following SQL on "target" returns "aa34077a4b2804c9c3ebbc97ad81d442":
+      """
+      SELECT coalesce(md5(string_agg(blkno || ':' || avail, ',' ORDER BY blkno)), 'empty')
+      FROM pg_freespace('public.events_copy');
+      """

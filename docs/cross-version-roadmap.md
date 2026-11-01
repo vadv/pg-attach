@@ -159,11 +159,10 @@ checksum-режим). Нужен update script расширения. Обе ст
 
 ### Опциональный функционал с отдельным риском
 
-Сейчас этого нет. Если добавлять — с отдельным design note:
-
-- **Перенос VM/FSM.** Формат VM стабилен с 9.6, но бит all-visible без
-  `PD_ALL_VISIBLE` на heap-странице даст неверный index-only scan. Нужен WAL/LSN
-  VM-страниц.
+- **Перенос VM/FSM — реализован.** Форки читаются после freeze-валидации и
+  `CHECKPOINT` под тем же `ACCESS EXCLUSIVE`, так что биты VM соответствуют
+  переданным heap-страницам (`PD_ALL_VISIBLE` согласован). В WAL-режиме
+  страницы VM/FSM логируются тем же `log_relation` путём, что и heap.
 - **Перенос статистики.** `pg_statistic.stavalues*` — `anyarray` с OID типа и
   version-specific форматом. Безопаснее `ANALYZE` на target, как сейчас.
 - **Другие index AM.** GIN с `pg_trgm` зависит от `default_char_signedness` (PG18

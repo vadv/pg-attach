@@ -290,6 +290,20 @@ pg_attach_attribute_count(Relation rel)
     return RelationGetDescr(rel)->natts;
 }
 
+/*
+ * Size of an optional fork, 0 when its file does not exist: unlike
+ * smgrnblocks this never ereports, which manifest building relies on.
+ */
+BlockNumber
+pg_attach_blocks_safe(Relation rel, ForkNumber fork)
+{
+    SMgrRelation smgr = RelationGetSmgr(rel);
+
+    if (!smgrexists(smgr, fork))
+        return 0;
+    return smgrnblocks(smgr, fork);
+}
+
 void
 pg_attach_write_page(Relation rel, ForkNumber fork, BlockNumber blkno, const char *page)
 {

@@ -34,13 +34,62 @@ pub extern "C-unwind" fn _PG_init() {
 }
 
 pub mod pg_attach {
-    use super::{pg_extern, pg_sys, SetOfIterator};
+    use super::{name, pg_extern, pg_sys, SetOfIterator, TableIterator};
+    use pgrx::spi::Spi;
 
     mod exporter;
     mod ffi;
     mod importer;
     mod source_client;
     mod wire;
+
+    /// Return physical and protocol compatibility metadata for this server.
+    ///
+    /// # Panics
+    /// Panics if the database encoding or installed extension version cannot be read.
+    #[must_use]
+    #[pg_extern]
+    #[allow(clippy::type_complexity)] // Keep pgrx SQL column names beside their Rust types.
+    pub fn pg_attach_server_info() -> TableIterator<
+        'static,
+        (
+            name!(server_version_num, i32),
+            name!(catversion, i32),
+            name!(block_size, i32),
+            name!(max_align, i32),
+            name!(endianness, &'static str),
+            name!(server_encoding, String),
+            name!(data_checksums, bool),
+            name!(protocol_version, i32),
+            name!(extension_version, String),
+        ),
+    > {
+        let server_encoding = Spi::get_one::<String>("SELECT current_setting('server_encoding')")
+            .unwrap_or_else(|error| panic!("pg_attach: cannot read server encoding: {error}"))
+            .unwrap_or_else(|| panic!("pg_attach: server encoding is NULL"));
+        let extension_version = Spi::get_one::<String>(
+            "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_attach'",
+        )
+        .unwrap_or_else(|error| panic!("pg_attach: cannot read extension version: {error}"))
+        .unwrap_or_else(|| panic!("pg_attach: extension version is missing"));
+        let endianness = if cfg!(target_endian = "little") {
+            "little"
+        } else {
+            "big"
+        };
+
+        TableIterator::new(std::iter::once((
+            i32::try_from(pg_sys::PG_VERSION_NUM).expect("server version fits i32"),
+            i32::try_from(pg_sys::CATALOG_VERSION_NO).expect("catalog version fits i32"),
+            i32::try_from(pg_sys::BLCKSZ).expect("block size fits i32"),
+            i32::try_from(pg_sys::MAXIMUM_ALIGNOF).expect("alignment fits i32"),
+            endianness,
+            server_encoding,
+            unsafe { pg_sys::DataChecksumsEnabled() },
+            i32::from(wire::VERSION),
+            extension_version,
+        )))
+    }
 
     /// Export one frozen table as a value-per-call COPY bytea stream.
     #[must_use]
