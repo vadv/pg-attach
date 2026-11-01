@@ -51,7 +51,8 @@ Feature: Local table clone inside a single database
       SELECT (SELECT count(*) FROM public.warm_copy)
           || '|' || (SELECT value FROM public.warm_copy WHERE id = 1)
           || '|' || (SELECT count(*) = 0 FROM pg_stat_activity
-                      WHERE query LIKE '%VACUUM (FREEZE)%' AND state = 'active');
+                      WHERE query LIKE '%VACUUM (FREEZE)%' AND state = 'active'
+                        AND pid <> pg_backend_pid());
       """
 
   @local
