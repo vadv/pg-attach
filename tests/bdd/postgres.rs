@@ -38,6 +38,42 @@ impl PostgresPair {
         source_checksums: bool,
         target_checksums: bool,
     ) -> Result<Self, String> {
+        Self::start_with_config(
+            source_major,
+            target_major,
+            source_checksums,
+            target_checksums,
+            None,
+            None,
+        )
+        .await
+    }
+
+    pub async fn start_with_icu_locales(
+        source_major: u16,
+        target_major: u16,
+        source_locale: &str,
+        target_locale: &str,
+    ) -> Result<Self, String> {
+        Self::start_with_config(
+            source_major,
+            target_major,
+            false,
+            false,
+            Some(source_locale),
+            Some(target_locale),
+        )
+        .await
+    }
+
+    async fn start_with_config(
+        source_major: u16,
+        target_major: u16,
+        source_checksums: bool,
+        target_checksums: bool,
+        source_locale: Option<&str>,
+        target_locale: Option<&str>,
+    ) -> Result<Self, String> {
         let temp = TempDir::new().map_err(|error| error.to_string())?;
         if is_root() {
             run(
@@ -46,8 +82,22 @@ impl PostgresPair {
                 false,
             )?;
         }
-        let source = Postgres::start(temp.path(), "source", source_major, source_checksums).await?;
-        let target = Postgres::start(temp.path(), "target", target_major, target_checksums).await?;
+        let source = Postgres::start(
+            temp.path(),
+            "source",
+            source_major,
+            source_checksums,
+            source_locale,
+        )
+        .await?;
+        let target = Postgres::start(
+            temp.path(),
+            "target",
+            target_major,
+            target_checksums,
+            target_locale,
+        )
+        .await?;
         Ok(Self {
             source,
             target,
@@ -142,7 +192,13 @@ struct Postgres {
 }
 
 impl Postgres {
-    async fn start(parent: &Path, name: &str, major: u16, checksums: bool) -> Result<Self, String> {
+    async fn start(
+        parent: &Path,
+        name: &str,
+        major: u16,
+        checksums: bool,
+        icu_locale: Option<&str>,
+    ) -> Result<Self, String> {
         let data = parent.join(name);
         let log = parent.join(format!("{name}.log"));
         let port = unused_port()?;
@@ -154,6 +210,11 @@ impl Postgres {
             "--auth=trust",
             "--username=postgres",
         ];
+        if let Some(locale) = icu_locale {
+            initdb_args.push("--locale-provider=icu");
+            initdb_args.push("--icu-locale");
+            initdb_args.push(locale);
+        }
         if checksums {
             initdb_args.push("--data-checksums");
         }

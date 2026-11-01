@@ -61,6 +61,26 @@ async fn fresh_cross_pair_checksum_mismatch(
     world.pair = Some(pair);
 }
 
+#[given(
+    expr = "a fresh PostgreSQL {int} to {int} pair with default ICU locales {string} and {string}"
+)]
+async fn fresh_cross_pair_icu_locales(
+    world: &mut AttachWorld,
+    source: u16,
+    target: u16,
+    source_locale: String,
+    target_locale: String,
+) {
+    let pair = tokio::time::timeout(
+        Duration::from_secs(60),
+        PostgresPair::start_with_icu_locales(source, target, &source_locale, &target_locale),
+    )
+    .await
+    .expect("PostgreSQL pair startup timed out")
+    .unwrap_or_else(|error| panic!("failed to start PostgreSQL pair: {error}"));
+    world.pair = Some(pair);
+}
+
 fn checksum_setting(enabled: &str) -> bool {
     match enabled {
         "enabled" => true,

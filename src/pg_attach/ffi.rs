@@ -255,6 +255,7 @@ impl Rel {
         attrs
     }
 
+    #[allow(clippy::too_many_lines)] // Keep version-safe catalog identity SQL beside its row mapping.
     pub fn attributes(&self) -> Result<Vec<wire::Attribute>, String> {
         let raw = self.raw_attributes();
         let identities = Spi::connect(|client| {
@@ -275,7 +276,24 @@ impl Rel {
                       ELSE coalesce(c.collversion, dc.collversion, '') END, \
                  CASE WHEN a.attcollation = 0 THEN '' ELSE coalesce(\
                       pg_collation_actual_version(c.oid), \
-                      pg_collation_actual_version(dc.oid), '') END \
+                      pg_collation_actual_version(dc.oid), '') END, \
+                 EXISTS ( \
+                   SELECT 1 FROM pg_database db \
+                   WHERE db.datname = current_database() AND c.oid = 100 \
+                     AND coalesce(row_to_json(db)->>'daticulocale', \
+                                  row_to_json(db)->>'datlocale') IS NOT NULL \
+                     AND NOT EXISTS ( \
+                       SELECT 1 FROM pg_collation dc \
+                       WHERE dc.collprovider = 'i' \
+                         AND dc.collname = coalesce(row_to_json(db)->>'daticulocale', \
+                                                    row_to_json(db)->>'datlocale') \
+                         AND coalesce(row_to_json(dc)->>'colllocale', \
+                                      row_to_json(dc)->>'colliculocale', dc.collcollate) = \
+                             coalesce(row_to_json(db)->>'daticulocale', \
+                                      row_to_json(db)->>'datlocale') \
+                         AND dc.collencoding IN (-1, pg_char_to_encoding(current_setting('server_encoding'))) \
+                     ) \
+                 ) AS default_identity_missing \
                  FROM pg_attribute a \
                  LEFT JOIN pg_type t ON t.oid = a.atttypid \
                  LEFT JOIN pg_namespace tn ON tn.oid = t.typnamespace \
@@ -286,7 +304,11 @@ impl Rel {
                      JOIN pg_collation dc ON \
                        (dc.collprovider = 'c' AND dc.collname = d.datcollate) OR \
                        (dc.collprovider = 'i' AND dc.collname = coalesce(\
-                         row_to_json(d)->>'daticulocale', row_to_json(d)->>'datlocale')) \
+                         row_to_json(d)->>'daticulocale', row_to_json(d)->>'datlocale') \
+                         AND coalesce(row_to_json(dc)->>'colllocale', \
+                                      row_to_json(dc)->>'colliculocale', dc.collcollate) = \
+                             coalesce(row_to_json(d)->>'daticulocale', \
+                                      row_to_json(d)->>'datlocale')) \
                      WHERE d.datname = current_database() AND c.oid = 100 \
                        AND dc.collencoding IN (-1, pg_char_to_encoding(current_setting('server_encoding'))) \
                      ORDER BY (dc.collprovider = 'i') DESC, dc.oid LIMIT 1 \
@@ -303,11 +325,18 @@ impl Rel {
                     row.get::<String>(2)?,
                     row.get::<String>(3)?.unwrap_or_default(),
                     row.get::<String>(4)?.unwrap_or_default(),
+                    row.get::<bool>(5)?.unwrap_or(true),
                 ));
             }
             Ok::<_, pgrx::spi::Error>(identities)
         })
         .map_err(|error| error.to_string())?;
+        if identities.iter().any(|identity| identity.4) {
+            return Err(
+                "database default collation identity cannot be proven without a concrete matching pg_collation row"
+                    .into(),
+            );
+        }
         if raw.len() != identities.len() {
             return Err("attribute catalog metadata changed during transfer".into());
         }
@@ -437,6 +466,7 @@ pub fn index_definition(oid: pg_sys::Oid) -> String {
         .into_owned()
 }
 
+#[allow(clippy::too_many_lines)] // Keep index catalog identity and default-collation checks together.
 pub fn index_metadata(oid: pg_sys::Oid) -> Result<wire::IndexMetadata, String> {
     let unsupported = Spi::get_one_with_args::<bool>(
         "SELECT indexprs IS NOT NULL OR indpred IS NOT NULL FROM pg_index WHERE indexrelid = $1",
@@ -460,6 +490,37 @@ pub fn index_metadata(oid: pg_sys::Oid) -> Result<wire::IndexMetadata, String> {
     if custom_opclass {
         return Err(
             "custom opclasses are not supported; only pg_catalog btree opclasses are allowed"
+                .into(),
+        );
+    }
+    let default_identity_missing = Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS ( \
+           SELECT 1 FROM pg_index i \
+           JOIN LATERAL unnest(i.indcollation) AS u(oid) ON true \
+           JOIN pg_collation c ON c.oid = u.oid \
+           JOIN pg_database db ON db.datname = current_database() \
+           WHERE i.indexrelid = $1 AND c.oid = 100 \
+             AND coalesce(row_to_json(db)->>'daticulocale', \
+                          row_to_json(db)->>'datlocale') IS NOT NULL \
+             AND NOT EXISTS ( \
+               SELECT 1 FROM pg_collation dc \
+               WHERE dc.collprovider = 'i' \
+                 AND dc.collname = coalesce(row_to_json(db)->>'daticulocale', \
+                                            row_to_json(db)->>'datlocale') \
+                 AND coalesce(row_to_json(dc)->>'colllocale', \
+                              row_to_json(dc)->>'colliculocale', dc.collcollate) = \
+                     coalesce(row_to_json(db)->>'daticulocale', \
+                              row_to_json(db)->>'datlocale') \
+                 AND dc.collencoding IN (-1, pg_char_to_encoding(current_setting('server_encoding'))) \
+             ) \
+         )",
+        &[oid.into()],
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "index default-collation metadata is missing".to_owned())?;
+    if default_identity_missing {
+        return Err(
+            "database default collation identity cannot be proven without a concrete matching pg_collation row"
                 .into(),
         );
     }
@@ -490,7 +551,11 @@ pub fn index_metadata(oid: pg_sys::Oid) -> Result<wire::IndexMetadata, String> {
                JOIN pg_collation dc ON \
                  (dc.collprovider = 'c' AND dc.collname = d.datcollate) OR \
                  (dc.collprovider = 'i' AND dc.collname = coalesce(\
-                   row_to_json(d)->>'daticulocale', row_to_json(d)->>'datlocale')) \
+                   row_to_json(d)->>'daticulocale', row_to_json(d)->>'datlocale') \
+                   AND coalesce(row_to_json(dc)->>'colllocale', \
+                                row_to_json(dc)->>'colliculocale', dc.collcollate) = \
+                       coalesce(row_to_json(d)->>'daticulocale', \
+                                row_to_json(d)->>'datlocale')) \
                WHERE d.datname = current_database() AND c.oid = 100 \
                  AND dc.collencoding IN (-1, pg_char_to_encoding(current_setting('server_encoding'))) \
                ORDER BY (dc.collprovider = 'i') DESC, dc.oid LIMIT 1 \

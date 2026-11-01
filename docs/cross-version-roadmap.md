@@ -64,6 +64,10 @@ physical attributes. Source и target должны совпасть по:
 - btree metapage version, `btm_allequalimage` и результату
   `_bt_allequalimage()` на target.
 
+Для database-default collation требуется concrete `pg_collation` row с совпадающими
+provider, resolved locale и encoding. Если такой строки нет, identity и версии не
+считаются доказанными: перенос отклоняется как для атрибутов, так и для indexes.
+
 TOAST index проверяется так же, как пользовательские btree. Expression, partial,
 exclusion, invalid и не-btree indexes отклоняются. Для автоматически созданного
 target schema descriptor по-прежнему содержит DDL metadata, но physical
