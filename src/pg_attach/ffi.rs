@@ -28,8 +28,11 @@ pub unsafe fn self_conninfo() -> Result<String, String> {
         .to_string_lossy()
         .into_owned();
     let port = unsafe { *std::ptr::addr_of!(pg_sys::PostPortNumber) };
+    let quote = |value: &str| format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"));
     Ok(format!(
-        "host={socket} port={port} dbname={dbname} user={user}",
+        "host={socket} port={port} dbname={} user={}",
+        quote(&dbname),
+        quote(&user),
     ))
 }
 
