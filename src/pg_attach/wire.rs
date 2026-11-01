@@ -2,12 +2,10 @@ use std::fmt;
 use std::io::{self, Read, Write};
 
 pub const MAGIC: [u8; 4] = *b"PGAT";
-pub const VERSION: u16 = 1;
-pub const HEADER_LEN: usize = 12;
+pub const HEADER_LEN: usize = 10;
 pub const PAGE_HEADER_LEN: usize = 12;
 const SCHEMA_MAGIC: [u8; 4] = *b"PGAS";
-const SCHEMA_VERSION: u16 = 1;
-const SCHEMA_HEADER_LEN: usize = 8;
+const SCHEMA_HEADER_LEN: usize = 6;
 const MAX_STRING: usize = 1024 * 1024;
 const MAX_RELATIONS: usize = 1024;
 const MAX_ATTRIBUTES: usize = 1600;
@@ -205,7 +203,6 @@ impl Manifest {
 pub fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     out.extend_from_slice(&SCHEMA_MAGIC);
-    out.extend_from_slice(&SCHEMA_VERSION.to_be_bytes());
     out.extend_from_slice(&0u16.to_be_bytes());
     put_len(
         &mut out,
@@ -249,8 +246,7 @@ pub fn decode_schema(input: &[u8]) -> Result<TableSchema> {
     if input.len() < SCHEMA_HEADER_LEN || input[..4] != SCHEMA_MAGIC {
         return Err(WireError("bad pg_attach schema magic".into()));
     }
-    if u16::from_be_bytes([input[4], input[5]]) != SCHEMA_VERSION || input[6] != 0 || input[7] != 0
-    {
+    if input[4] != 0 || input[5] != 0 {
         return Err(WireError("unsupported pg_attach schema header".into()));
     }
     let mut decoder = Decoder {
@@ -323,7 +319,6 @@ pub fn encode_header(manifest: &Manifest) -> Result<Vec<u8>> {
     let manifest = manifest.encode()?;
     let mut output = Vec::with_capacity(HEADER_LEN + manifest.len());
     output.extend_from_slice(&MAGIC);
-    output.extend_from_slice(&VERSION.to_be_bytes());
     output.extend_from_slice(&0u16.to_be_bytes());
     put_u32(
         &mut output,
@@ -362,13 +357,10 @@ impl<R: Read> StreamReader<R> {
         if header[..4] != MAGIC {
             return Err(WireError("bad pg_attach magic".into()));
         }
-        if u16::from_be_bytes([header[4], header[5]]) != VERSION {
-            return Err(WireError("unsupported pg_attach protocol version".into()));
-        }
-        if header[6] != 0 || header[7] != 0 {
+        if header[4] != 0 || header[5] != 0 {
             return Err(WireError("unsupported pg_attach header flags".into()));
         }
-        let length = usize::try_from(u32::from_be_bytes(header[8..12].try_into().unwrap()))
+        let length = usize::try_from(u32::from_be_bytes(header[6..10].try_into().unwrap()))
             .expect("u32 length fits usize");
         if length == 0 || length > MAX_STRING * 16 {
             return Err(WireError(format!("invalid manifest length {length}")));
@@ -644,6 +636,43 @@ mod tests {
         assert_eq!(packet.block, 7);
         assert_eq!(packet.bytes, vec![5; 8192]);
         assert!(reader.next().unwrap().is_none());
+    }
+
+    #[test]
+    fn headers_use_unversioned_layout() {
+        let header = encode_header(&manifest()).unwrap();
+        assert_eq!(HEADER_LEN, 10);
+        assert_eq!(&header[..6], b"PGAT\0\0");
+        let manifest_length =
+            usize::try_from(u32::from_be_bytes(header[6..10].try_into().unwrap())).unwrap();
+        assert_eq!(manifest_length, header.len() - HEADER_LEN);
+
+        let schema = encode_schema(&TableSchema {
+            columns: Vec::new(),
+            constraints: Vec::new(),
+            indexes: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(SCHEMA_HEADER_LEN, 6);
+        assert_eq!(&schema[..6], b"PGAS\0\0");
+    }
+
+    #[test]
+    fn rejects_bad_flags_and_truncated_headers() {
+        let mut header = encode_header(&manifest()).unwrap();
+        header[4] = 1;
+        assert!(StreamReader::new(header.as_slice()).is_err());
+        assert!(StreamReader::new(&header[..HEADER_LEN - 1]).is_err());
+
+        let mut schema = encode_schema(&TableSchema {
+            columns: Vec::new(),
+            constraints: Vec::new(),
+            indexes: Vec::new(),
+        })
+        .unwrap();
+        schema[4] = 1;
+        assert!(decode_schema(&schema).is_err());
+        assert!(decode_schema(&schema[..SCHEMA_HEADER_LEN - 1]).is_err());
     }
 
     #[test]

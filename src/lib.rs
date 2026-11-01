@@ -43,7 +43,7 @@ pub mod pg_attach {
     mod source_client;
     mod wire;
 
-    /// Return physical and protocol compatibility metadata for this server.
+    /// Return physical and extension compatibility metadata for this server.
     ///
     /// # Panics
     /// Panics if the database encoding or installed extension version cannot be read.
@@ -60,16 +60,28 @@ pub mod pg_attach {
             name!(endianness, &'static str),
             name!(server_encoding, String),
             name!(data_checksums, bool),
-            name!(protocol_version, i32),
             name!(extension_version, String),
         ),
     > {
-        let server_encoding = Spi::get_one::<String>("SELECT current_setting('server_encoding')")
-            .unwrap_or_else(|error| panic!("pg_attach: cannot read server encoding: {error}"))
-            .unwrap_or_else(|| panic!("pg_attach: server encoding is NULL"));
-        let extension_version = Spi::get_one::<String>(
-            "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_attach'",
-        )
+        // Read-only SPI avoids assigning an XID before the source VACUUM.
+        let server_encoding = Spi::connect(|client| {
+            client
+                .select("SELECT current_setting('server_encoding')", Some(1), &[])?
+                .first()
+                .get_one::<String>()
+        })
+        .unwrap_or_else(|error| panic!("pg_attach: cannot read server encoding: {error}"))
+        .unwrap_or_else(|| panic!("pg_attach: server encoding is NULL"));
+        let extension_version = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_attach'",
+                    Some(1),
+                    &[],
+                )?
+                .first()
+                .get_one::<String>()
+        })
         .unwrap_or_else(|error| panic!("pg_attach: cannot read extension version: {error}"))
         .unwrap_or_else(|| panic!("pg_attach: extension version is missing"));
         let endianness = if cfg!(target_endian = "little") {
@@ -86,7 +98,6 @@ pub mod pg_attach {
             endianness,
             server_encoding,
             unsafe { pg_sys::DataChecksumsEnabled() },
-            i32::from(wire::VERSION),
             extension_version,
         )))
     }

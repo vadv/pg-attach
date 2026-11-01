@@ -387,6 +387,7 @@ pub unsafe fn import(
     generate_wal: bool,
 ) -> Result<(), String> {
     let mut source = SourceClient::connect(source_conninfo)?;
+    source.check_compatibility()?;
     source.prepare_direct(source_table)?;
     let schema = source.schema(source_table)?;
     let targets = open_target(&schema, target_table)?;

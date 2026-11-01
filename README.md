@@ -12,7 +12,11 @@ PoC PostgreSQL extension that freezes and transfers a table between two PostgreS
 - Import runs `VACUUM (FREEZE)` on the source and validates frozen heap/TOAST tuples under lock. Visibility map and free space map forks are transferred with each relation, so index-only scans and free-space reuse start warm; run `VACUUM (ANALYZE)` on the target for planner statistics.
 - No partitions, foreign tables, unlogged tables, non-btree indexes, or cross-version upgrades.
 
-Both instances need the same extension build installed. No background worker or `shared_preload_libraries` entry is needed. The source only serves a `COPY` stream; the target pulls it through libpq. The source role must own the table (or have equivalent VACUUM privileges) and have permission to run `CHECKPOINT` (normally a superuser or a role with `pg_checkpoint`). Heap and TOAST are validated under `ACCESS EXCLUSIVE` before checkpoint using their visibility maps. Only pages without `ALL_FROZEN` need a validation read; all data pages are then read for streaming.
+Both instances need the same extension version installed. No background worker or `shared_preload_libraries` entry is needed. The source only serves a `COPY` stream; the target pulls it through libpq. Immediately after connecting, the target calls `pg_attach_server_info()` and verifies the extension version, PostgreSQL major, `BLCKSZ`, alignment, endianness, encoding and checksum mode. A missing function, malformed response or mismatch closes the connection before `VACUUM`, locks or `CHECKPOINT`.
+
+The extension version is the only pg_attach wire/schema compatibility version; there is no independent protocol-version negotiation. Any compatibility-affecting wire, schema or SQL API change requires an extension-version change before release.
+
+The source role must own the table (or have equivalent VACUUM privileges) and have permission to run `CHECKPOINT` (normally a superuser or a role with `pg_checkpoint`). Heap and TOAST are validated under `ACCESS EXCLUSIVE` before checkpoint using their visibility maps. Only pages without `ALL_FROZEN` need a validation read; all data pages are then read for streaming.
 
 ## Build and test
 
