@@ -70,7 +70,20 @@ esac
 psql_a -c "CHECKPOINT;"
 sync; sleep 2
 
-snap_io() { awk '{r+=substr($2,8)+0; w+=substr($3,8)+0; ri+=substr($4,6)+0; wi+=substr($5,6)+0} END{printf "%d %d %d %d", r, w, ri, wi}' /sys/fs/cgroup/io.stat; }
+snap_io() {
+  local r=0 w=0 ri=0 wi=0 f
+  while read -ra fields; do
+    for f in $fields; do
+      case $f in
+        rbytes=*) r=$((r + ${f#rbytes=}));;
+        wbytes=*) w=$((w + ${f#wbytes=}));;
+        rios=*)   ri=$((ri + ${f#rios=}));;
+        wios=*)   wi=$((wi + ${f#wios=}));;
+      esac
+    done
+  done < /sys/fs/cgroup/io.stat
+  echo "$r $w $ri $wi"
+}
 snap_cpu() { awk '/^usage_usec/{print $2}' /sys/fs/cgroup/cpu.stat; }
 snap_lsn() { L=$(psql_a -c "select pg_current_wal_lsn()::text"); M=0; if [ "$TWO_INSTANCE" = 1 ]; then M=$(psql_b -c "select pg_current_wal_lsn()::text"); fi; echo "$L $M"; }
 lsn_num() { echo $(( 0x$(echo "$1" | cut -d/ -f1) * 16777216 + 0x$(echo "$1" | cut -d/ -f2) )); }
@@ -104,9 +117,18 @@ T1=$(date +%s.%N)
 if [ "$TWO_INSTANCE" = 1 ]; then psql_b -c "CHECKPOINT;" >/dev/null; else psql_a -c "CHECKPOINT;" >/dev/null; fi
 sync
 # wait until block-layer write counters stop moving (writeback settled)
+snap_wbytes() {
+  local w=0 f
+  while read -ra fields; do
+    for f in $fields; do
+      case $f in wbytes=*) w=$((w + ${f#wbytes=}));; esac
+    done
+  done < /sys/fs/cgroup/io.stat
+  echo $w
+}
 prev=-1; stable=0; waited=0
 while [ $stable -lt 2 ] && [ $waited -lt 300 ]; do
-  cur=$(awk '{w+=substr($3,8)+0} END{print w+0}' /sys/fs/cgroup/io.stat)
+  cur=$(snap_wbytes)
   if [ "$cur" = "$prev" ]; then stable=$((stable+1)); else stable=0; fi
   prev=$cur; sleep 2; waited=$((waited+2))
 done
