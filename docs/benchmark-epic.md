@@ -23,34 +23,53 @@
 
 ## Варианты замера
 
-1. **`pg_stat_io`** (основной для COPY-пути, PG16–18): `reads`,
+### Основной уровень — blackbox контейнера (симметричен для всех методов)
+
+1. **Блочный I/O**: cgroup v2 `/sys/fs/cgroup/io.stat` (`rbytes`/`wbytes`/
+   `rios`/`wios`) — всё, что контейнер реально прочитал/записал на диск;
+   не зависит от пути PostgreSQL (bufmgr или прямые smgr). Дельта
+   до/после метода. Проверено в Docker Desktop.
+2. **CPU**: cgroup v2 `/sys/fs/cgroup/cpu.stat` (`usage_usec`,
+   `user_usec`/`system_usec`) — все процессы инстанса. Дельта до/после.
+3. **Wall time**: `clock_timestamp()` обёрткой вокруг метода.
+4. **WAL-байты**: `pg_current_wal_lsn()` до/после метода (показывает
+   no-WAL режим ≈ 0).
+
+Протокол blackbox: каждый метод в свежем контейнере (cold page cache —
+честно и повторяемо); финальный snapshot после `CHECKPOINT` + `sync` +
+паузы на writeback. Warm-режим — повтор в том же контейнере.
+
+Ограничения blackbox (зафиксированы):
+- тёплый page cache прячет чтения из `rbytes` — поэтому cold-режим основной;
+- тома с macOS-хоста (virtiofs) уходят мимо cgroup — данные держим внутри
+  FS контейнера (наш образ так и делает);
+- асинхронный writeback — финальный snapshot после `sync` + паузы.
+
+### Разбивочный уровень — white-box (откуда именно байты)
+
+5. **`pg_stat_io`** (для COPY-пути, PG16–18): `reads`,
    `writes`, `extends` по `backend_type` и `context`
    (`normal`/`bulkread`/`bulkwrite`). Байты: в PG18 есть прямые колонки
    `read_bytes`/`write_bytes`/`extend_bytes`; в PG16–17 — `count ×
    op_bytes`. Snapshot до/после + `pg_stat_reset()`.
    ⚠ Проверено по исходникам: счётчики живут в bufmgr, поэтому прямые
    `smgrread`/`smgrwrite` pg_attach в `pg_stat_io` не попадают.
-2. **WAL-байты**: `pg_current_wal_lsn()` до/после метода. Точно и дёшево.
-   Разница no-WAL против WAL-режима — ключевая демонстрация.
-3. **CPU**: cgroup v2 `/sys/fs/cgroup/cpu.stat` (`usage_usec`,
-   `user_usec`/`system_usec`) внутри контейнера — покрывает все процессы
-   инстанса. Дельта до/после метода. Запасной вариант: `docker stats
-   --no-stream` (менее точный), `/proc/<pid>/stat` по дереву postmaster.
-4. **Wall time**: `clock_timestamp()` обёрткой вокруг метода.
-5. **Дополнительно** (по желанию): `track_io_timing=on` для времени ожидания
+6. **Манифест pg_attach**: страницы heap+TOAST+indexes × 8K —
+   детерминированный источник для pg_attach-методов (логируется
+   расширением).
+7. **Дополнительно** (по желанию): `track_io_timing=on` для времени ожидания
    I/O; `EXPLAIN (ANALYZE, BUFFERS)` на фазе `CREATE INDEX` COPY-пути, чтобы
-   показать CPU-стоимость построения индекса отдельно; cgroup `io.stat`
-   (блочный уровень) как перекрёстная проверка при cold cache.
+   показать CPU-стоимость построения индекса отдельно.
 
 ## Источники метрик по методам
 
-| Метрика | COPY-путь | pg_attach |
-| --- | --- | --- |
-| Чтения (байты/страницы) | `pg_stat_io` reads | манифест: страницы heap+TOAST+indexes × 8K (детерминировано; логируется расширением) |
-| Записи (байты/страницы) | `pg_stat_io` writes/extends | манифест: те же страницы × 8K |
-| WAL | LSN до/после | LSN до/после (no-WAL режим ≈ 0) |
-| CPU | cgroup `cpu.stat` | cgroup `cpu.stat` |
-| Wall | `clock_timestamp()` | `clock_timestamp()` |
+| Метрика | Источник (все методы одинаково) |
+| --- | --- |
+| Чтения/записи диска | cgroup `io.stat` rbytes/wbytes (blackbox) |
+| Логические страницы | COPY: `pg_stat_io`; pg_attach: манифест × 8K (разбивка) |
+| WAL | LSN до/после |
+| CPU | cgroup `cpu.stat` |
+| Wall | `clock_timestamp()` |
 
 ## Датасет
 
