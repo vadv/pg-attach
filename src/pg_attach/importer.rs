@@ -1,6 +1,7 @@
 use super::exporter;
 use super::ffi::{self, Rel, MAIN_FORK};
 use super::source_client::SourceClient;
+use super::source_client::SourceClient;
 use super::wire::{self, Manifest, RelationKind, TableSchema};
 use pgrx::pg_sys;
 use pgrx::spi::Spi;
@@ -417,12 +418,14 @@ pub unsafe fn import(
     Ok(())
 }
 
-/// Clone a frozen table inside the current database with no client transport.
-/// Reads the source pages directly under the transaction's own locks and
-/// installs them through the same page pipeline as the network import.
+/// Clone a table inside the current database with no client transport.
+/// Freezes, locks and checkpoints the source through a self connection so the
+/// caller only invokes this one function, then installs the pages through the
+/// same pipeline as the network import.
 ///
 /// # Safety
-/// Runs inside PostgreSQL. Source and target relations stay locked until commit.
+/// Runs inside PostgreSQL. The self connection holds ACCESS EXCLUSIVE on the
+/// source until the clone finishes; target relations stay locked until commit.
 pub unsafe fn import_local(
     source_table: &str,
     target_table: &str,
@@ -432,15 +435,27 @@ pub unsafe fn import_local(
     if ffi::resolve_relation(target_table) == Ok(source_oid) {
         return Err("target table must differ from the source table".into());
     }
-    // The frozen gate also takes ACCESS EXCLUSIVE (held until commit) and
-    // flushes heap and TOAST buffers, replacing the cross-instance lock and
-    // checkpoint dance. VACUUM cannot run inside this transaction, so the
-    // caller freezes the source first.
-    if !exporter::source_is_frozen(source_table)? {
-        return Err(format!(
-            "source table {source_table} is not fully frozen; run VACUUM FREEZE first"
-        ));
-    }
+    // One-function contract: VACUUM cannot run inside this transaction, so the
+    // freeze/lock/checkpoint dance runs on a separate self connection that
+    // keeps ACCESS EXCLUSIVE until the clone is done. Retry bounds writer races.
+    pgrx::notice!("pg_attach: VACUUM (FREEZE) {source_table}");
+    pgrx::log!("pg_attach: local clone {source_table} -> {target_table}");
+    let mut self_client = SourceClient::connect(&ffi::self_conninfo()?)?;
+    self_client.prepare_direct(source_table)?;
+    let result = clone_local(source_table, target_table, generate_wal);
+    // Releasing the lock transaction also releases the source table.
+    let released = self_client.rollback();
+    result?;
+    released
+}
+
+/// Page-copy stage of the local clone, run under the self connection's locks.
+unsafe fn clone_local(
+    source_table: &str,
+    target_table: &str,
+    generate_wal: bool,
+) -> Result<(), String> {
+    let source_oid = ffi::resolve_relation(source_table)?;
     let schema = wire::decode_schema(&exporter::export_schema(source_table)?)
         .map_err(|error| error.to_string())?;
     let targets = open_target(&schema, target_table)?;
@@ -454,8 +469,8 @@ pub unsafe fn import_local(
         targets.indexes,
         targets.toast_index,
     )?;
-    // Flush the remaining source relations (indexes) so direct smgr reads see
-    // current state; heap and TOAST were flushed by the frozen gate.
+    // prepare_direct already verified frozen state and ran CHECKPOINT, so
+    // direct smgr reads see the flushed source without further flushing.
     let relations: Vec<(u32, RelationKind, u8, u32)> = state
         .manifest
         .relations
@@ -465,7 +480,6 @@ pub unsafe fn import_local(
     let source_toast_oid = Rel::open(source_oid, pg_sys::NoLock.cast_signed()).toast_oid();
     for (index, (oid, kind, fork, blocks)) in relations.into_iter().enumerate() {
         let relation = Rel::open(pg_sys::Oid::from_u32(oid), pg_sys::NoLock.cast_signed());
-        relation.flush_buffers();
         for block in 0..blocks {
             let mut page = vec![0u8; ffi::PAGE_SIZE];
             relation.read_page(MAIN_FORK, block, &mut page);

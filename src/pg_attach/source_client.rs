@@ -220,6 +220,11 @@ impl SourceClient {
         self.execute("COMMIT")
     }
 
+    /// Roll back the lock transaction, releasing ACCESS EXCLUSIVE on the source.
+    pub fn rollback(&mut self) -> Result<(), String> {
+        self.execute("ROLLBACK")
+    }
+
     pub fn schema(&mut self, source_table: &str) -> Result<TableSchema, String> {
         let literal = format!("'{}'", source_table.replace('\'', "''"));
         let command =

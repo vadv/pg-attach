@@ -110,10 +110,11 @@ pub mod pg_attach {
         }
     }
 
-    /// Clone a frozen table inside the current database with no client transport.
+    /// Clone a table inside the current database, freezing it first.
+    /// Emits a NOTICE for the automatic VACUUM (FREEZE) step.
     ///
     /// # Panics
-    /// Panics if freezing validation, target creation or page installation fails.
+    /// Panics if freezing, target creation or page installation fails.
     #[pg_extern]
     pub fn pg_attach_import_local(source_table: &str, target_table: &str, generate_wal: bool) {
         unsafe {
