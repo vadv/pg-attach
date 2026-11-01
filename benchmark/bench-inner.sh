@@ -79,7 +79,6 @@ IO1=$(snap_io); CPU1=$(snap_cpu); LSN1=$(snap_lsn)
 T0=$(date +%s.%N)
 
 case "$METHOD" in
-case "$METHOD" in
   attach-local-nowal) psql_a -c "SELECT pg_attach_import_local('public.$TABLE','public.${TABLE}_copy',false);" >/dev/null; psql_a -c "ANALYZE $DSTNAME" >/dev/null ;;
   attach-local-wal)   psql_a -c "SELECT pg_attach_import_local('public.$TABLE','public.${TABLE}_copy',true);" >/dev/null; psql_a -c "ANALYZE $DSTNAME" >/dev/null ;;
   attach-network)     psql_b -c "SELECT pg_attach_import('host=$SA port=$PA dbname=postgres user=postgres','public.$TABLE','public.${TABLE}_copy',true);" >/dev/null; psql_b -c "ANALYZE $DSTNAME" >/dev/null ;;
