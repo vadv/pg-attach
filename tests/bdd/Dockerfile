@@ -9,7 +9,7 @@ RUN cargo clippy --release --all-targets --locked -- -D warnings -D clippy::peda
     && cargo test --release --locked \
     && cargo build --release --locked
 
-FROM pg-attach-pg${PG_VERSION}:dev AS fixtures
+FROM postgres:${PG_VERSION}-bookworm AS fixtures
 ARG PG_VERSION
 RUN apt-get update \
     && apt-get install -y --no-install-recommends gcc postgresql-server-dev-${PG_VERSION} \

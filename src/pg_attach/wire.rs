@@ -62,15 +62,106 @@ pub struct Relation {
     pub toast_index_oid: u32,
 }
 
+#[allow(clippy::struct_excessive_bools)] // These are independent PostgreSQL catalog flags.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Attribute {
     pub name: String,
-    pub type_oid: u32,
-    pub collation_oid: u32,
+    pub type_name: String,
+    pub collation_name: Option<String>,
+    pub collation_version: String,
+    pub collation_actual_version: String,
     pub typmod: i32,
     pub len: i16,
+    pub align: u8,
+    pub by_val: bool,
+    pub storage: u8,
+    pub has_missing: bool,
+    pub generated: u8,
     pub not_null: bool,
     pub dropped: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexMetadata {
+    pub shape: String,
+    pub btree_version: u32,
+    pub all_equal_image: bool,
+    pub expected_all_equal_image: bool,
+}
+
+pub fn validate_attributes(attributes: &[Attribute]) -> std::result::Result<(), String> {
+    const SAFE_TYPES: &[&str] = &[
+        "bool",
+        "bytea",
+        "char",
+        "name",
+        "int8",
+        "int2",
+        "int4",
+        "text",
+        "json",
+        "xml",
+        "point",
+        "path",
+        "polygon",
+        "line",
+        "circle",
+        "box",
+        "float4",
+        "float8",
+        "bpchar",
+        "varchar",
+        "date",
+        "time",
+        "timestamp",
+        "timestamptz",
+        "interval",
+        "numeric",
+        "uuid",
+        "jsonb",
+        "money",
+        "inet",
+        "cidr",
+        "macaddr",
+        "macaddr8",
+        "bit",
+        "varbit",
+        "pg_lsn",
+        "tsvector",
+        "tsquery",
+        "jsonpath",
+    ];
+    for attribute in attributes.iter().filter(|attribute| !attribute.dropped) {
+        if attribute.has_missing {
+            return Err(format!(
+                "column {} uses fast defaults/missing values, which are not supported",
+                attribute.name
+            ));
+        }
+        if attribute.generated == b'v' {
+            return Err(format!(
+                "column {} is a virtual generated column, which is not supported",
+                attribute.name
+            ));
+        }
+        if attribute.generated != 0 && attribute.generated != b's' {
+            return Err(format!(
+                "column {} has an unknown generated kind",
+                attribute.name
+            ));
+        }
+        let base = attribute
+            .type_name
+            .strip_prefix("pg_catalog._")
+            .or_else(|| attribute.type_name.strip_prefix("pg_catalog."));
+        if !base.is_some_and(|base| SAFE_TYPES.contains(&base)) {
+            return Err(format!(
+                "column {} has unsafe type {}; only built-in types without catalog OIDs in their values are supported",
+                attribute.name, attribute.type_name
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,6 +173,7 @@ pub struct SchemaColumn {
     pub not_null: bool,
     pub identity: String,
     pub generated_expr: Option<String>,
+    pub storage: u8,
     pub dropped: bool,
 }
 
@@ -103,10 +195,11 @@ pub struct TableSchema {
 pub struct Manifest {
     pub source_table: String,
     pub target_table: String,
-    pub checksums: bool,
+    pub source_checksums: bool,
+    pub target_checksums: bool,
     pub relations: Vec<Relation>,
     pub attributes: Vec<Attribute>,
-    pub index_definitions: Vec<String>,
+    pub indexes: Vec<IndexMetadata>,
 }
 
 impl Manifest {
@@ -114,7 +207,8 @@ impl Manifest {
         let mut out = Vec::new();
         put_string(&mut out, &self.source_table)?;
         put_string(&mut out, &self.target_table)?;
-        out.push(u8::from(self.checksums));
+        out.push(u8::from(self.source_checksums));
+        out.push(u8::from(self.target_checksums));
         put_len(&mut out, self.relations.len(), MAX_RELATIONS, "relations")?;
         for relation in &self.relations {
             put_u32(&mut out, relation.oid)?;
@@ -132,21 +226,26 @@ impl Manifest {
         )?;
         for attribute in &self.attributes {
             put_string(&mut out, &attribute.name)?;
-            put_u32(&mut out, attribute.type_oid)?;
-            put_u32(&mut out, attribute.collation_oid)?;
+            put_string(&mut out, &attribute.type_name)?;
+            put_optional_string(&mut out, attribute.collation_name.as_deref())?;
+            put_string(&mut out, &attribute.collation_version)?;
+            put_string(&mut out, &attribute.collation_actual_version)?;
             out.extend_from_slice(&attribute.typmod.to_be_bytes());
             out.extend_from_slice(&attribute.len.to_be_bytes());
+            out.push(attribute.align);
+            out.push(u8::from(attribute.by_val));
+            out.push(attribute.storage);
+            out.push(u8::from(attribute.has_missing));
+            out.push(attribute.generated);
             out.push(u8::from(attribute.not_null));
             out.push(u8::from(attribute.dropped));
         }
-        put_len(
-            &mut out,
-            self.index_definitions.len(),
-            MAX_RELATIONS,
-            "indexes",
-        )?;
-        for definition in &self.index_definitions {
-            put_string(&mut out, definition)?;
+        put_len(&mut out, self.indexes.len(), MAX_RELATIONS, "indexes")?;
+        for index in &self.indexes {
+            put_string(&mut out, &index.shape)?;
+            put_u32(&mut out, index.btree_version)?;
+            out.push(u8::from(index.all_equal_image));
+            out.push(u8::from(index.expected_all_equal_image));
         }
         Ok(out)
     }
@@ -155,7 +254,8 @@ impl Manifest {
         let mut decoder = Decoder { input, offset: 0 };
         let source_table = decoder.string()?;
         let target_table = decoder.string()?;
-        let checksums = decoder.boolean()?;
+        let source_checksums = decoder.boolean()?;
+        let target_checksums = decoder.boolean()?;
         let relation_count = decoder.len(MAX_RELATIONS, "relations")?;
         let mut relations = Vec::with_capacity(relation_count);
         for _ in 0..relation_count {
@@ -173,18 +273,30 @@ impl Manifest {
         for _ in 0..attribute_count {
             attributes.push(Attribute {
                 name: decoder.string()?,
-                type_oid: decoder.u32()?,
-                collation_oid: decoder.u32()?,
+                type_name: decoder.string()?,
+                collation_name: decoder.optional_string()?,
+                collation_version: decoder.string()?,
+                collation_actual_version: decoder.string()?,
                 typmod: decoder.i32()?,
                 len: decoder.i16()?,
+                align: decoder.u8()?,
+                by_val: decoder.boolean()?,
+                storage: decoder.u8()?,
+                has_missing: decoder.boolean()?,
+                generated: decoder.u8()?,
                 not_null: decoder.boolean()?,
                 dropped: decoder.boolean()?,
             });
         }
         let index_count = decoder.len(MAX_RELATIONS, "indexes")?;
-        let mut index_definitions = Vec::with_capacity(index_count);
+        let mut indexes = Vec::with_capacity(index_count);
         for _ in 0..index_count {
-            index_definitions.push(decoder.string()?);
+            indexes.push(IndexMetadata {
+                shape: decoder.string()?,
+                btree_version: decoder.u32()?,
+                all_equal_image: decoder.boolean()?,
+                expected_all_equal_image: decoder.boolean()?,
+            });
         }
         if decoder.offset != input.len() {
             return Err(WireError("trailing bytes in manifest".into()));
@@ -192,10 +304,11 @@ impl Manifest {
         Ok(Self {
             source_table,
             target_table,
-            checksums,
+            source_checksums,
+            target_checksums,
             relations,
             attributes,
-            index_definitions,
+            indexes,
         })
     }
 }
@@ -218,6 +331,7 @@ pub fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         out.push(u8::from(column.not_null));
         put_string(&mut out, &column.identity)?;
         put_optional_string(&mut out, column.generated_expr.as_deref())?;
+        out.push(column.storage);
         out.push(u8::from(column.dropped));
     }
     put_len(
@@ -264,6 +378,7 @@ pub fn decode_schema(input: &[u8]) -> Result<TableSchema> {
             not_null: decoder.boolean()?,
             identity: decoder.string()?,
             generated_expr: decoder.optional_string()?,
+            storage: decoder.u8()?,
             dropped: decoder.boolean()?,
         });
     }
@@ -564,11 +679,31 @@ impl Decoder<'_> {
 mod tests {
     use super::*;
 
+    fn attribute() -> Attribute {
+        Attribute {
+            name: "id".into(),
+            type_name: "pg_catalog.int4".into(),
+            collation_name: None,
+            collation_version: String::new(),
+            collation_actual_version: String::new(),
+            typmod: -1,
+            len: 4,
+            align: b'i',
+            by_val: true,
+            storage: b'p',
+            has_missing: false,
+            generated: 0,
+            not_null: true,
+            dropped: false,
+        }
+    }
+
     fn manifest() -> Manifest {
         Manifest {
             source_table: "public.events".into(),
             target_table: "public.events_copy".into(),
-            checksums: true,
+            source_checksums: true,
+            target_checksums: true,
             relations: vec![Relation {
                 oid: 42,
                 name: "events".into(),
@@ -577,19 +712,52 @@ mod tests {
                 blocks: 1,
                 toast_index_oid: 0,
             }],
-            attributes: vec![Attribute {
-                name: "id".into(),
-                type_oid: 23,
-                collation_oid: 0,
-                typmod: -1,
-                len: 4,
-                not_null: true,
-                dropped: false,
+            attributes: vec![attribute()],
+            indexes: vec![IndexMetadata {
+                shape: "1|1|1|int4_ops".into(),
+                btree_version: 4,
+                all_equal_image: true,
+                expected_all_equal_image: true,
             }],
-            index_definitions: vec![
-                "CREATE INDEX events_id_idx ON public.events USING btree (id)".into(),
-            ],
         }
+    }
+
+    #[test]
+    fn rejects_missing_values_virtual_columns_and_oid_bearing_types() {
+        let missing = Attribute {
+            has_missing: true,
+            ..attribute()
+        };
+        assert!(validate_attributes(&[missing])
+            .unwrap_err()
+            .contains("missing values"));
+        let virtual_column = Attribute {
+            generated: b'v',
+            ..attribute()
+        };
+        assert!(validate_attributes(&[virtual_column])
+            .unwrap_err()
+            .contains("virtual generated"));
+        for type_name in [
+            "public.mood",
+            "pg_catalog._mood",
+            "pg_catalog.regclass",
+            "pg_catalog.oid",
+            "pg_catalog.pg_class",
+        ] {
+            let unsafe_type = Attribute {
+                type_name: type_name.into(),
+                ..attribute()
+            };
+            assert!(validate_attributes(&[unsafe_type])
+                .unwrap_err()
+                .contains("unsafe type"));
+        }
+        let safe_array = Attribute {
+            type_name: "pg_catalog._int4".into(),
+            ..attribute()
+        };
+        assert!(validate_attributes(&[safe_array]).is_ok());
     }
 
     #[test]
@@ -603,6 +771,7 @@ mod tests {
                 not_null: true,
                 identity: String::new(),
                 generated_expr: None,
+                storage: b'e',
                 dropped: false,
             }],
             constraints: vec!["CHECK (length(payload) > 0)".into()],

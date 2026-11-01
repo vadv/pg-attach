@@ -14,19 +14,59 @@ async fn fresh_pair(world: &mut AttachWorld) {
 
 #[given(expr = "a fresh PostgreSQL pair with checksums {string}")]
 async fn fresh_pair_with_checksums(world: &mut AttachWorld, enabled: String) {
-    let checksums = match enabled.as_str() {
-        "enabled" => true,
-        "disabled" => false,
-        _ => panic!("checksums must be enabled or disabled"),
-    };
     let pair = tokio::time::timeout(
         Duration::from_secs(60),
-        PostgresPair::start_with_checksums(checksums),
+        PostgresPair::start_with_checksums(checksum_setting(&enabled)),
     )
     .await
     .expect("PostgreSQL pair startup timed out")
     .unwrap_or_else(|error| panic!("failed to start PostgreSQL pair: {error}"));
     world.pair = Some(pair);
+}
+
+#[given(expr = "a fresh PostgreSQL {int} to {int} pair with checksums {string}")]
+async fn fresh_cross_pair(world: &mut AttachWorld, source: u16, target: u16, enabled: String) {
+    let pair = tokio::time::timeout(
+        Duration::from_secs(60),
+        PostgresPair::start_versions(source, target, checksum_setting(&enabled)),
+    )
+    .await
+    .expect("PostgreSQL pair startup timed out")
+    .unwrap_or_else(|error| panic!("failed to start PostgreSQL pair: {error}"));
+    world.pair = Some(pair);
+}
+
+#[given(
+    expr = "a fresh PostgreSQL {int} to {int} pair with source checksums {string} and target checksums {string}"
+)]
+async fn fresh_cross_pair_checksum_mismatch(
+    world: &mut AttachWorld,
+    source: u16,
+    target: u16,
+    source_enabled: String,
+    target_enabled: String,
+) {
+    let pair = tokio::time::timeout(
+        Duration::from_secs(60),
+        PostgresPair::start_with_options(
+            source,
+            target,
+            checksum_setting(&source_enabled),
+            checksum_setting(&target_enabled),
+        ),
+    )
+    .await
+    .expect("PostgreSQL pair startup timed out")
+    .unwrap_or_else(|error| panic!("failed to start PostgreSQL pair: {error}"));
+    world.pair = Some(pair);
+}
+
+fn checksum_setting(enabled: &str) -> bool {
+    match enabled {
+        "enabled" => true,
+        "disabled" => false,
+        _ => panic!("checksums must be enabled or disabled"),
+    }
 }
 
 #[given(expr = "the following SQL is executed on {string}:")]
@@ -90,15 +130,18 @@ fn remove_recorded_data_file(world: &mut AttachWorld) {
     );
     std::fs::remove_file(&path)
         .unwrap_or_else(|error| panic!("failed to remove {}: {error}", path.display()));
-    let stem = path.file_name().expect("file name").to_string_lossy().into_owned();
+    let stem = path
+        .file_name()
+        .expect("file name")
+        .to_string_lossy()
+        .into_owned();
     for segment in 1.. {
         let sibling = path.with_file_name(format!("{stem}_{segment}"));
         if !sibling.exists() {
             break;
         }
-        std::fs::remove_file(&sibling).unwrap_or_else(|error| {
-            panic!("failed to remove {}: {error}", sibling.display())
-        });
+        std::fs::remove_file(&sibling)
+            .unwrap_or_else(|error| panic!("failed to remove {}: {error}", sibling.display()));
     }
 }
 

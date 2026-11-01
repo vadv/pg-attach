@@ -20,6 +20,24 @@ impl PostgresPair {
     }
 
     pub async fn start_with_checksums(checksums: bool) -> Result<Self, String> {
+        let major = default_major()?;
+        Self::start_with_options(major, major, checksums, checksums).await
+    }
+
+    pub async fn start_versions(
+        source_major: u16,
+        target_major: u16,
+        checksums: bool,
+    ) -> Result<Self, String> {
+        Self::start_with_options(source_major, target_major, checksums, checksums).await
+    }
+
+    pub async fn start_with_options(
+        source_major: u16,
+        target_major: u16,
+        source_checksums: bool,
+        target_checksums: bool,
+    ) -> Result<Self, String> {
         let temp = TempDir::new().map_err(|error| error.to_string())?;
         if is_root() {
             run(
@@ -28,8 +46,8 @@ impl PostgresPair {
                 false,
             )?;
         }
-        let source = Postgres::start(temp.path(), "source", checksums).await?;
-        let target = Postgres::start(temp.path(), "target", checksums).await?;
+        let source = Postgres::start(temp.path(), "source", source_major, source_checksums).await?;
+        let target = Postgres::start(temp.path(), "target", target_major, target_checksums).await?;
         Ok(Self {
             source,
             target,
@@ -120,10 +138,11 @@ struct Postgres {
     data: PathBuf,
     log: PathBuf,
     port: u16,
+    major: u16,
 }
 
 impl Postgres {
-    async fn start(parent: &Path, name: &str, checksums: bool) -> Result<Self, String> {
+    async fn start(parent: &Path, name: &str, major: u16, checksums: bool) -> Result<Self, String> {
         let data = parent.join(name);
         let log = parent.join(format!("{name}.log"));
         let port = unused_port()?;
@@ -138,16 +157,25 @@ impl Postgres {
         if checksums {
             initdb_args.push("--data-checksums");
         }
-        run("initdb", &initdb_args, true)?;
+        run(&pg_program(major, "initdb"), &initdb_args, true)?;
         if !checksums {
             // PG18 enables checksums by default; older versions report already disabled.
-            let _ = run("pg_checksums", &["-D", &data_arg, "--disable"], true);
+            let _ = run(
+                &pg_program(major, "pg_checksums"),
+                &["-D", &data_arg, "--disable"],
+                true,
+            );
         }
-        let postgres = Self { data, log, port };
+        let postgres = Self {
+            data,
+            log,
+            port,
+            major,
+        };
         let socket = parent.to_string_lossy();
         let options = format!("-F -p {port} -k {socket} -c listen_addresses=127.0.0.1");
         run(
-            "pg_ctl",
+            &pg_program(major, "pg_ctl"),
             &[
                 "-D",
                 &postgres.data.to_string_lossy(),
@@ -166,7 +194,7 @@ impl Postgres {
 
     fn stop(&self) -> Result<(), String> {
         run(
-            "pg_ctl",
+            &pg_program(self.major, "pg_ctl"),
             &[
                 "-D",
                 &self.data.to_string_lossy(),
@@ -186,7 +214,11 @@ impl Postgres {
             .next()
             .unwrap_or_default()
             .to_string();
-        run("pg_ctl", &["kill", "KILL", &pid], true)?;
+        run(
+            &pg_program(self.major, "pg_ctl"),
+            &["kill", "KILL", &pid],
+            true,
+        )?;
         // Wait for the postmaster to exit, then drop the stale lock file: a
         // killed postmaster cannot clean up, and PID reuse makes the next
         // start treat the file as a live server.
@@ -199,11 +231,7 @@ impl Postgres {
         }
         let _ = std::fs::remove_file(self.data.join("postmaster.pid"));
         // Same for the unix socket: killed postmasters leave both files behind.
-        let socket_dir = self
-            .data
-            .parent()
-            .unwrap_or(&self.data)
-            .to_path_buf();
+        let socket_dir = self.data.parent().unwrap_or(&self.data).to_path_buf();
         let _ = std::fs::remove_file(socket_dir.join(format!(".s.PGSQL.{}.lock", self.port)));
         let _ = std::fs::remove_file(socket_dir.join(format!(".s.PGSQL.{}", self.port)));
         Ok(())
@@ -224,8 +252,10 @@ impl Postgres {
         let log = self.log.to_string_lossy().into_owned();
         for attempt in 1..=3 {
             match run(
-                "pg_ctl",
-                &["-D", &data, "-l", &log, "-w", "-t", "30", "-o", &options, "start"],
+                &pg_program(self.major, "pg_ctl"),
+                &[
+                    "-D", &data, "-l", &log, "-w", "-t", "30", "-o", &options, "start",
+                ],
                 true,
             ) {
                 Ok(()) => return self.wait_until_ready().await,
@@ -365,6 +395,23 @@ async fn query(port: u16, sql: &str) -> Result<String, String> {
     result
 }
 
+fn default_major() -> Result<u16, String> {
+    parse_major(&std::env::var("PG_VERSION").unwrap_or_else(|_| "17".to_string()))
+}
+
+fn parse_major(version: &str) -> Result<u16, String> {
+    version
+        .split('.')
+        .next()
+        .unwrap_or_default()
+        .parse()
+        .map_err(|_| "PG_VERSION must start with a PostgreSQL major number".to_string())
+}
+
+fn pg_program(major: u16, program: &str) -> String {
+    format!("/usr/lib/postgresql/{major}/bin/{program}")
+}
+
 fn unused_port() -> Result<u16, String> {
     TcpListener::bind("127.0.0.1:0")
         .map_err(|error| error.to_string())?
@@ -403,5 +450,15 @@ fn run(program: &str, args: &[&str], as_postgres: bool) -> Result<(), String> {
             output.status,
             String::from_utf8_lossy(&output.stderr)
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn parses_major_and_official_docker_full_versions() {
+        assert_eq!(super::parse_major("18"), Ok(18));
+        assert_eq!(super::parse_major("18.6"), Ok(18));
+        assert!(super::parse_major("not-a-version").is_err());
     }
 }

@@ -8,6 +8,7 @@ use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 /// heap block before page verification. Negative values disable the hook.
 static DEBUG_CORRUPT_PAGE: GucSetting<i32> = GucSetting::<i32>::new(-1);
 static DEBUG_CORRUPT_OFFSET: GucSetting<i32> = GucSetting::<i32>::new(-1);
+static DEBUG_DISABLE_LZ4: GucSetting<bool> = GucSetting::<bool>::new(false);
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
@@ -28,6 +29,14 @@ pub extern "C-unwind" fn _PG_init() {
         &DEBUG_CORRUPT_OFFSET,
         -1,
         8191,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"pg_attach.debug_disable_lz4",
+        c"Simulate a target without lz4 support (debug)",
+        c"Rejects lz4-compressed values during this transfer.",
+        &DEBUG_DISABLE_LZ4,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -61,9 +70,12 @@ pub mod pg_attach {
             name!(server_encoding, String),
             name!(data_checksums, bool),
             name!(extension_version, String),
+            name!(max_toast_chunk_size, i32),
+            name!(max_identifier_length, i32),
+            name!(checksum_algorithm_version, i32),
+            name!(lz4_supported, bool),
         ),
     > {
-        // Read-only SPI avoids assigning an XID before the source VACUUM.
         let server_encoding = Spi::connect(|client| {
             client
                 .select("SELECT current_setting('server_encoding')", Some(1), &[])?
@@ -72,18 +84,16 @@ pub mod pg_attach {
         })
         .unwrap_or_else(|error| panic!("pg_attach: cannot read server encoding: {error}"))
         .unwrap_or_else(|| panic!("pg_attach: server encoding is NULL"));
-        let extension_version = Spi::connect(|client| {
-            client
-                .select(
-                    "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_attach'",
-                    Some(1),
-                    &[],
-                )?
-                .first()
-                .get_one::<String>()
-        })
-        .unwrap_or_else(|error| panic!("pg_attach: cannot read extension version: {error}"))
-        .unwrap_or_else(|| panic!("pg_attach: extension version is missing"));
+        let extension_version =
+            Spi::connect(|client| {
+                client.select(
+                "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_attach'",
+                Some(1),
+                &[],
+            )?.first().get_one::<String>()
+            })
+            .unwrap_or_else(|error| panic!("pg_attach: cannot read extension version: {error}"))
+            .unwrap_or_else(|| panic!("pg_attach: extension version is missing"));
         let endianness = if cfg!(target_endian = "little") {
             "little"
         } else {
@@ -99,6 +109,10 @@ pub mod pg_attach {
             server_encoding,
             unsafe { pg_sys::DataChecksumsEnabled() },
             extension_version,
+            ffi::max_toast_chunk_size(),
+            ffi::max_identifier_length(),
+            ffi::checksum_algorithm_version(),
+            ffi::lz4_supported(),
         )))
     }
 
@@ -109,6 +123,7 @@ pub mod pg_attach {
         source_table: &str,
         target_table: &str,
         target_toast_oid: pg_sys::Oid,
+        target_lz4_supported: bool,
         target_checksums: bool,
     ) -> SetOfIterator<'static, Vec<u8>> {
         unsafe {
@@ -116,6 +131,7 @@ pub mod pg_attach {
                 source_table,
                 target_table,
                 target_toast_oid,
+                target_lz4_supported,
                 target_checksums,
             )
         }

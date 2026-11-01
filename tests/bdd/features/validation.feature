@@ -18,7 +18,7 @@ Feature: Transfer validation and failure isolation
       """
 
   Scenario: Server info exposes physical and extension compatibility
-    Then the following SQL on "target" returns "t|t|t|t|t|t|t|t":
+    Then the following SQL on "target" returns "t|t|t|t|t|t|t|t|t|t|t|t":
       """
       SELECT server_version_num = current_setting('server_version_num')::integer,
              catversion > 0,
@@ -27,14 +27,19 @@ Feature: Transfer validation and failure isolation
              endianness IN ('little', 'big'),
              server_encoding = current_setting('server_encoding'),
              data_checksums = current_setting('data_checksums')::boolean,
-             extension_version = (SELECT extversion FROM pg_extension WHERE extname = 'pg_attach')
+             extension_version = (SELECT extversion FROM pg_extension WHERE extname = 'pg_attach'),
+             max_toast_chunk_size > 0,
+             max_identifier_length = current_setting('max_identifier_length')::integer,
+             checksum_algorithm_version > 0,
+             lz4_supported IN (true, false)
       FROM pg_attach_server_info();
       """
     And the following SQL on "target" returns "t":
       """
       WITH server_info AS MATERIALIZED (
         SELECT server_version_num, catversion, block_size, max_align,
-               endianness, server_encoding, data_checksums, extension_version
+               endianness, server_encoding, data_checksums, extension_version,
+               max_toast_chunk_size, max_identifier_length, checksum_algorithm_version, lz4_supported
         FROM pg_attach_server_info()
       )
       SELECT txid_current_if_assigned() IS NULL FROM server_info;
@@ -86,10 +91,16 @@ Feature: Transfer validation and failure isolation
         endianness text,
         server_encoding text,
         data_checksums boolean,
-        extension_version text
+        extension_version text,
+        max_toast_chunk_size integer,
+        max_identifier_length integer,
+        checksum_algorithm_version integer,
+        lz4_supported boolean
       ) LANGUAGE SQL AS $$
         SELECT <source_version>, info.catversion, info.block_size, info.max_align,
-               info.endianness, info.server_encoding, info.data_checksums, <source_extension>
+               info.endianness, info.server_encoding, info.data_checksums, <source_extension>,
+               info.max_toast_chunk_size, info.max_identifier_length,
+               info.checksum_algorithm_version, info.lz4_supported
         FROM pg_attach_server_info_original() AS info;
       $$;
       """
@@ -138,10 +149,16 @@ Feature: Transfer validation and failure isolation
         endianness text,
         server_encoding text,
         data_checksums boolean,
-        extension_version text
+        extension_version text,
+        max_toast_chunk_size integer,
+        max_identifier_length integer,
+        checksum_algorithm_version integer,
+        lz4_supported boolean
       ) LANGUAGE SQL AS $$
         SELECT info.server_version_num, info.catversion, info.block_size, info.max_align,
-               info.endianness, info.server_encoding, info.data_checksums, info.extension_version
+               info.endianness, info.server_encoding, info.data_checksums, info.extension_version,
+               info.max_toast_chunk_size, info.max_identifier_length,
+               info.checksum_algorithm_version, info.lz4_supported
         FROM pg_attach_server_info_original() AS info
         WHERE false;
       $$;
@@ -155,7 +172,7 @@ Feature: Transfer validation and failure isolation
       );
       INSERT INTO public.events VALUES (42, 'keep', 'old');
       """
-    Then the following SQL on "target" fails with "source compatibility check failed: source server info must return one row with seven columns":
+    Then the following SQL on "target" fails with "source compatibility check failed: source server info must return one row with eleven columns":
       """
       SELECT pg_attach_import(
         'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
@@ -186,10 +203,16 @@ Feature: Transfer validation and failure isolation
         endianness text,
         server_encoding text,
         data_checksums boolean,
-        extension_version text
+        extension_version text,
+        max_toast_chunk_size integer,
+        max_identifier_length integer,
+        checksum_algorithm_version integer,
+        lz4_supported boolean
       ) LANGUAGE SQL AS $$
         SELECT info.server_version_num, info.catversion, info.block_size, info.max_align,
-               info.endianness, info.server_encoding, info.data_checksums, NULL::text
+               info.endianness, info.server_encoding, info.data_checksums, NULL::text,
+               info.max_toast_chunk_size, info.max_identifier_length,
+               info.checksum_algorithm_version, info.lz4_supported
         FROM pg_attach_server_info_original() AS info;
       $$;
       """
