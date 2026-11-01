@@ -5,6 +5,37 @@ use std::os::raw::{c_char, c_int};
 pub const PAGE_SIZE: usize = pg_sys::BLCKSZ as usize;
 pub const MAIN_FORK: pg_sys::ForkNumber::Type = pg_sys::ForkNumber::MAIN_FORKNUM;
 
+/// Connection string pointing back at this backend's own postmaster, used to
+/// run VACUUM FREEZE outside the import transaction.
+///
+/// # Safety
+/// Reads server GUCs and OIDs; runs inside PostgreSQL.
+pub unsafe fn self_conninfo() -> Result<String, String> {
+    let sockets = CStr::from_ptr(pg_sys::GetConfigOption(
+        c"unix_socket_directories".as_ptr(),
+        false,
+        true,
+    ))
+    .to_string_lossy();
+    let socket = sockets.split(',').next().unwrap_or_default().trim();
+    if socket.is_empty() {
+        return Err("unix_socket_directories is empty".into());
+    }
+    let dbname = CStr::from_ptr(pg_sys::get_database_name(pg_sys::MyDatabaseId))
+        .to_string_lossy()
+        .into_owned();
+    let user = CStr::from_ptr(pg_sys::GetUserNameFromId(pg_sys::GetUserId(), true))
+        .to_string_lossy()
+        .into_owned();
+    let port = unsafe { *std::ptr::addr_of!(pg_sys::PostPortNumber) };
+    let quote = |value: &str| format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"));
+    Ok(format!(
+        "host={socket} port={port} dbname={} user={}",
+        quote(&dbname),
+        quote(&user),
+    ))
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct RawAttribute {

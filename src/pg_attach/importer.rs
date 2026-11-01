@@ -216,38 +216,107 @@ fn prepare_state(
     })
 }
 
+impl ImportState {
+    /// Validate and install one decoded page packet.
+    fn accept(&mut self, mut packet: wire::PagePacket) -> Result<(), String> {
+        let relation_index = usize::from(packet.relation);
+        if relation_index >= self.targets.len() {
+            return Err(format!("invalid relation index {}", packet.relation));
+        }
+        if packet.fork != u8::try_from(MAIN_FORK).expect("main fork fits in u8") {
+            return Err("only main-fork packets are supported".into());
+        }
+        if packet.block != self.next_blocks[relation_index] {
+            return Err(format!(
+                "out-of-order block {} for relation {}",
+                packet.block, relation_index
+            ));
+        }
+        if packet.block >= self.manifest.relations[relation_index].blocks {
+            return Err("page exceeds manifest relation length".into());
+        }
+        // Debug-only corruption hook for the BDD suite: flips one byte of a
+        // chosen heap block to exercise page verification end to end.
+        if relation_index == 0 {
+            let block = crate::DEBUG_CORRUPT_PAGE.get();
+            let offset = crate::DEBUG_CORRUPT_OFFSET.get();
+            if block >= 0
+                && offset >= 0
+                && packet.block == u32::try_from(block).expect("nonnegative block fits u32")
+                && usize::try_from(offset).is_ok_and(|offset| offset < packet.bytes.len())
+            {
+                packet.bytes[usize::try_from(offset).expect("nonnegative offset fits usize")] ^=
+                    0xFF;
+            }
+        }
+        if !Rel::verify_page(packet.block, &mut packet.bytes, self.manifest.checksums) {
+            return Err(format!(
+                "page verification failed for block {} of relation {}",
+                packet.block, relation_index
+            ));
+        }
+        self.targets[relation_index].write_page(MAIN_FORK, packet.block, &packet.bytes);
+        self.next_blocks[relation_index] += 1;
+        Ok(())
+    }
+
+    /// Complete the stream: WAL or sync every installed relation.
+    fn finish(&mut self, generate_wal: bool) -> Result<(), String> {
+        for (index, relation) in self.manifest.relations.iter().enumerate() {
+            if self.next_blocks[index] != relation.blocks {
+                return Err(format!(
+                    "stream ended early for {}: block {} of {}",
+                    relation.name, self.next_blocks[index], relation.blocks
+                ));
+            }
+        }
+        for target in &self.targets {
+            if generate_wal {
+                target.log_relation(MAIN_FORK);
+            } else {
+                target.sync_relation(MAIN_FORK);
+            }
+        }
+        self.done = true;
+        Ok(())
+    }
+}
+
+/// Relations of a prepared target, opened under ACCESS EXCLUSIVE.
+struct TargetRelations {
+    main: Rel,
+    toast: Option<Rel>,
+    toast_index: Option<Rel>,
+    indexes: Vec<(String, Rel)>,
+}
+
+/// Resolve or create the target table, then open all its relations. The
+/// schema descriptor is only needed when the target has to be created.
+///
 /// # Safety
-/// Runs inside PostgreSQL. All target relations remain exclusively locked until commit.
-#[allow(clippy::too_many_lines)] // One streaming transaction; no hidden background work.
-pub unsafe fn import(
-    source_conninfo: &str,
-    source_table: &str,
-    target_table: &str,
-    generate_wal: bool,
-) -> Result<(), String> {
-    let mut source = SourceClient::connect(source_conninfo)?;
-    source.prepare_direct(source_table)?;
+/// Opens relations under ACCESS EXCLUSIVE; callers keep the handles in the
+/// same transaction until commit.
+unsafe fn open_target(schema: &TableSchema, target_table: &str) -> Result<TargetRelations, String> {
     let target_oid = if let Ok(oid) = ffi::resolve_relation(target_table) {
         oid
     } else {
-        let schema = source.schema(source_table)?;
-        create_target(&schema, target_table)?;
+        create_target(schema, target_table)?;
         ffi::resolve_relation(target_table)?
     };
-    let target_main = Rel::open(target_oid, pg_sys::AccessExclusiveLock.cast_signed());
-    if !target_main.is_plain_logged_table() {
+    let main = Rel::open(target_oid, pg_sys::AccessExclusiveLock.cast_signed());
+    if !main.is_plain_logged_table() {
         return Err("target must be a plain logged table".into());
     }
-    let target_toast_oid = target_main.toast_oid();
-    let target_toast = if target_toast_oid == pg_sys::Oid::INVALID {
+    let toast_oid = main.toast_oid();
+    let toast = if toast_oid == pg_sys::Oid::INVALID {
         None
     } else {
         Some(Rel::open(
-            target_toast_oid,
+            toast_oid,
             pg_sys::AccessExclusiveLock.cast_signed(),
         ))
     };
-    let target_toast_index = if let Some(ref toast) = target_toast {
+    let toast_index = if let Some(ref toast) = toast {
         let oid = toast.toast_index_oid();
         if oid == pg_sys::Oid::INVALID {
             return Err("target TOAST relation has no valid index".into());
@@ -260,9 +329,8 @@ pub unsafe fn import(
     } else {
         None
     };
-
-    let mut target_indexes = Vec::new();
-    for oid in target_main.index_oids() {
+    let mut indexes = Vec::new();
+    for oid in main.index_oids() {
         let index = Rel::open(oid, pg_sys::AccessExclusiveLock.cast_signed());
         if !index.is_btree() {
             return Err(format!(
@@ -270,8 +338,34 @@ pub unsafe fn import(
                 index.name()
             ));
         }
-        target_indexes.push((ffi::index_definition(oid), index));
+        indexes.push((ffi::index_definition(oid), index));
     }
+    Ok(TargetRelations {
+        main,
+        toast,
+        toast_index,
+        indexes,
+    })
+}
+
+/// # Safety
+/// Runs inside PostgreSQL. All target relations remain exclusively locked until commit.
+#[allow(clippy::too_many_lines)] // One streaming transaction; no hidden background work.
+pub unsafe fn import(
+    source_conninfo: &str,
+    source_table: &str,
+    target_table: &str,
+    generate_wal: bool,
+) -> Result<(), String> {
+    let mut source = SourceClient::connect(source_conninfo)?;
+    source.prepare_direct(source_table)?;
+    let schema = source.schema(source_table)?;
+    let targets = open_target(&schema, target_table)?;
+    let target_toast_oid = targets.main.toast_oid();
+    let mut target_main = Some(targets.main);
+    let mut target_toast = targets.toast;
+    let mut target_toast_index = targets.toast_index;
+    let mut target_indexes = targets.indexes;
 
     let target_checksums = ffi::data_checksums_enabled();
     let command = format!(
@@ -282,9 +376,6 @@ pub unsafe fn import(
         if target_checksums { "true" } else { "false" },
     );
     let mut state: Option<ImportState> = None;
-    let mut target_main = Some(target_main);
-    let mut target_toast = target_toast;
-    let mut target_toast_index = target_toast_index;
 
     source.copy_out(&command, |row| {
         if state.as_ref().is_some_and(|state| state.done) {
@@ -311,66 +402,10 @@ pub unsafe fn import(
 
         let import = state.as_mut().unwrap();
         let packet = wire::decode_page(row).map_err(|error| error.to_string())?;
-        let Some(mut packet) = packet else {
-            for (index, relation) in import.manifest.relations.iter().enumerate() {
-                if import.next_blocks[index] != relation.blocks {
-                    return Err(format!(
-                        "stream ended early for {}: block {} of {}",
-                        relation.name, import.next_blocks[index], relation.blocks
-                    ));
-                }
-            }
-            for target in &import.targets {
-                if generate_wal {
-                    target.log_relation(MAIN_FORK);
-                } else {
-                    target.sync_relation(MAIN_FORK);
-                }
-            }
-            import.done = true;
-            return Ok(());
-        };
-
-        let relation_index = usize::from(packet.relation);
-        if relation_index >= import.targets.len() {
-            return Err(format!("invalid relation index {}", packet.relation));
+        match packet {
+            Some(packet) => import.accept(packet),
+            None => import.finish(generate_wal),
         }
-        if packet.fork != u8::try_from(MAIN_FORK).expect("main fork fits in u8") {
-            return Err("only main-fork packets are supported".into());
-        }
-        if packet.block != import.next_blocks[relation_index] {
-            return Err(format!(
-                "out-of-order block {} for relation {}",
-                packet.block, relation_index
-            ));
-        }
-        if packet.block >= import.manifest.relations[relation_index].blocks {
-            return Err("page exceeds manifest relation length".into());
-        }
-        let target = &import.targets[relation_index];
-        // Debug-only corruption hook for the BDD suite: flips one byte of a
-        // chosen heap block to exercise page verification end to end.
-        if relation_index == 0 {
-            let block = crate::DEBUG_CORRUPT_PAGE.get();
-            let offset = crate::DEBUG_CORRUPT_OFFSET.get();
-            if block >= 0
-                && offset >= 0
-                && packet.block == u32::try_from(block).expect("nonnegative block fits u32")
-                && usize::try_from(offset).is_ok_and(|offset| offset < packet.bytes.len())
-            {
-                packet.bytes[usize::try_from(offset).expect("nonnegative offset fits usize")] ^=
-                    0xFF;
-            }
-        }
-        if !Rel::verify_page(packet.block, &mut packet.bytes, import.manifest.checksums) {
-            return Err(format!(
-                "page verification failed for block {} of relation {}",
-                packet.block, relation_index
-            ));
-        }
-        target.write_page(MAIN_FORK, packet.block, &packet.bytes);
-        import.next_blocks[relation_index] += 1;
-        Ok(())
     })?;
 
     let state = state.ok_or_else(|| "source returned no pg_attach header".to_owned())?;
@@ -379,4 +414,32 @@ pub unsafe fn import(
     }
     source.commit()?;
     Ok(())
+}
+
+/// Clone a table inside the current database with no client transport.
+/// Reuses the network import against this backend's own postmaster: the
+/// self connection runs the freeze/lock/checkpoint retry and streams the
+/// pages, this backend only installs them. Building source metadata here
+/// instead would deadlock against the self connection's ACCESS EXCLUSIVE
+/// lock on the source.
+///
+/// # Safety
+/// Runs inside PostgreSQL. Emits a NOTICE for the automatic VACUUM (FREEZE).
+pub unsafe fn import_local(
+    source_table: &str,
+    target_table: &str,
+    generate_wal: bool,
+) -> Result<(), String> {
+    let source_oid = ffi::resolve_relation(source_table)?;
+    if ffi::resolve_relation(target_table) == Ok(source_oid) {
+        return Err("target table must differ from the source table".into());
+    }
+    pgrx::notice!("pg_attach: VACUUM (FREEZE) {source_table}");
+    pgrx::log!("pg_attach: local clone {source_table} -> {target_table}");
+    import(
+        &ffi::self_conninfo()?,
+        source_table,
+        target_table,
+        generate_wal,
+    )
 }
