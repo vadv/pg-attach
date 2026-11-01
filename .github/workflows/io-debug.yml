@@ -1,7 +1,9 @@
 name: io-debug
 
 on:
-  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/io-debug.yml
 
 jobs:
   debug:
