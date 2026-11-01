@@ -220,8 +220,7 @@ impl SourceClient {
         self.execute("COMMIT")
     }
 
-    /// Roll back the lock transaction, releasing ACCESS EXCLUSIVE on the source.
-(&mut self, source_table: &str) -> Result<TableSchema, String> {
+    pub fn schema(&mut self, source_table: &str) -> Result<TableSchema, String> {
         let literal = format!("'{}'", source_table.replace('\'', "''"));
         let command =
             format!("COPY (SELECT pg_attach_export_schema({literal})) TO STDOUT (FORMAT binary)");
