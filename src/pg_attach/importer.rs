@@ -298,12 +298,11 @@ struct TargetRelations {
 /// Opens relations under ACCESS EXCLUSIVE; callers keep the handles in the
 /// same transaction until commit.
 unsafe fn open_target(schema: &TableSchema, target_table: &str) -> Result<TargetRelations, String> {
-    let target_oid = match ffi::resolve_relation(target_table) {
-        Ok(oid) => oid,
-        Err(_) => {
-            create_target(schema, target_table)?;
-            ffi::resolve_relation(target_table)?
-        }
+    let target_oid = if let Ok(oid) = ffi::resolve_relation(target_table) {
+        oid
+    } else {
+        create_target(schema, target_table)?;
+        ffi::resolve_relation(target_table)?
     };
     let main = Rel::open(target_oid, pg_sys::AccessExclusiveLock.cast_signed());
     if !main.is_plain_logged_table() {
