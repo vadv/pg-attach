@@ -43,7 +43,7 @@ pub mod pg_attach {
     mod source_client;
     mod wire;
 
-    /// Return physical and protocol compatibility metadata for this server.
+    /// Return physical and extension compatibility metadata for this server.
     ///
     /// # Panics
     /// Panics if the database encoding or installed extension version cannot be read.
@@ -60,7 +60,6 @@ pub mod pg_attach {
             name!(endianness, &'static str),
             name!(server_encoding, String),
             name!(data_checksums, bool),
-            name!(protocol_version, i32),
             name!(extension_version, String),
         ),
     > {
@@ -86,7 +85,6 @@ pub mod pg_attach {
             endianness,
             server_encoding,
             unsafe { pg_sys::DataChecksumsEnabled() },
-            i32::from(wire::VERSION),
             extension_version,
         )))
     }

@@ -34,60 +34,49 @@ pg_upgrade **не деформирует туплы**: он копирует/л�
 | XID, `pg_xact`, multixact | переносит clog, выставляет next XID | требует frozen tuples и invalid `xmax`: страница не ссылается на XID источника |
 | OID внутри данных | сохраняет OID (`--binary-upgrade`) | переписывает `va_toastrelid`; остальные встроенные OID — только отказ (см. ниже) |
 
-## Текущее состояние: версия не проверяется
+## Текущее состояние: same-major handshake реализован
 
-README требует одинаковую major, но код этого не обеспечивает:
-
-- manifest v1 (`src/pg_attach/wire.rs`) не содержит ни версии сервера, ни
-  catversion, ни `MAXALIGN`/порядка байт. Экспортер, собранный под 16, и
-  импортер под 18 уже сейчас договорятся по протоколу;
-- `BLCKSZ` фактически зафиксирован: `encode_page` и `StreamReader` принимают
-  только 8192 байта, но ошибка возникает уже в потоке, а не при handshake;
-- совместимость проверяется только после `VACUUM (FREEZE)`, `ACCESS EXCLUSIVE`
-  и `CHECKPOINT` на source — то есть после дорогой и блокирующей подготовки.
-
-Первый шаг — сделать ограничение same-major явным, и только потом его ослаблять.
-
-## Расширение протокола
-
-### 1. Handshake до freeze
-
-Новая source-функция (например, `pg_attach_source_info()`) отдаёт компактный
-бинарный дескриптор по тому же COPY-транспорту. Importer вызывает её **до**
-`prepare_direct` и отклоняет несовместимый source, не трогая его lock/checkpoint.
-
-Состав:
-
-- версия расширения и поддерживаемые версии wire/schema;
-- `server_version_num`, `catversion` (для диагностики и сообщений);
-- поля `pg_control_init()`: `database_block_size`, `max_data_alignment`,
-  `max_toast_chunk_size`, `max_identifier_length`, `data_page_checksum_version`
-  (в PG18 есть ещё `default_char_signedness` — нужен только для будущих GIN);
-- порядок байт сборки (`cfg!(target_endian)`), т.к. `pg_control_init` его не
-  отдаёт;
-- методы TOAST-сжатия, поддерживаемые сборкой (`pglz`, `lz4`).
+Сразу после подключения target вызывает SQL-функцию `pg_attach_server_info()` на
+source. Проверка выполняется **до** `VACUUM (FREEZE)`, locks, `CHECKPOINT`, чтения
+схемы и изменений target. Отсутствие функции, malformed response или несовпадение
+параметров закрывает соединение без fallback.
 
 Правила на target:
 
 | Условие | Решение |
 | --- | --- |
-| source major = target major | как сейчас |
-| source major < target major, обе в матрице | разрешено при выполнении проверок ниже |
-| source major > target major | отказ |
-| major вне матрицы | отказ |
-| `BLCKSZ`, `MAXALIGN`, endianness, TOAST chunk size, `NAMEDATALEN` различаются | отказ |
-| версии wire/расширения несовместимы | отказ |
-| source поддерживает метод сжатия, которого нет на target | отказ |
+| source major = target major | разрешено, включая разные minor |
+| source major ≠ target major | отказ |
+| `extension_version` различается | отказ |
+| `BLCKSZ`, `MAXALIGN`, endianness, encoding, checksum mode различаются | отказ |
 
-### 2. Manifest v2
+`extension_version` — единственная версия совместимости pg_attach, включая его
+wire/schema-форматы. Независимых версий протокола, manifest и schema descriptor
+нет. Manifest не дублирует server version и ABI-параметры, потому что они уже
+проверены handshake. Любое изменение wire/schema/SQL API, влияющее на
+совместимость, требует изменения версии расширения перед публикацией.
 
-`VERSION = 2`; v1 не принимать (в v1 нет версии source, решить безопасно нельзя;
-PoC не обещает совместимость протокола).
+## Дальнейшее расширение протокола
 
-Добавить:
+### 1. Дополнительные handshake-параметры
 
-- **Источник:** `server_version_num`, отдельно `source_checksums` и
-  `target_checksums` (сейчас это одно поле `checksums`).
+Для будущего cross-major handshake нужно добавить:
+
+- `max_toast_chunk_size`, `max_identifier_length`, версию checksum-алгоритма
+  (в PG18 есть ещё `default_char_signedness` — нужен только для будущих GIN);
+- методы TOAST-сжатия, поддерживаемые сборкой (`pglz`, `lz4`).
+
+Это дополнительные physical prerequisites, а не независимые версии протокола.
+
+### 2. Изменения manifest
+
+Менять manifest нужно только вместе с версией расширения. Добавлять отдельное
+`VERSION`-поле или negotiation между форматами не требуется.
+
+Предстоит добавить:
+
+- **Источник:** отдельно `source_checksums` и `target_checksums`, если переход
+  checksum off → on будет разрешён (сейчас это одно поле `checksums`).
 - **Атрибуты** (`wire::Attribute`): `attgenerated`, `atthasmissing` и
   текстовое `attmissingval`, `attalign`, `attbyval`, `attstorage`. Плюс
   отпечаток типа вместо голого `type_oid` (см. «OID внутри данных»).
@@ -101,9 +90,10 @@ PoC не обещает совместимость протокола).
 
 ### 3. SQL API
 
-Сигнатура `pg_attach_export_stream` меняется (target передаёт свою major и
-checksum-режим). Нужен update script расширения. Обе стороны — один и тот же
-релиз pg_attach, собранный под свою major; handshake проверяет `extversion`.
+Для cross-major сигнатура `pg_attach_export_stream` может измениться (target
+передаёт свою major и checksum-режим). Нужен update script расширения. Обе
+стороны — один и тот же релиз pg_attach, собранный под свою major; handshake
+проверяет `extversion`.
 
 ### 4. Инварианты страниц и туплов
 
@@ -171,11 +161,11 @@ checksum-режим). Нужен update script расширения. Обе ст
 
 ## Этапы
 
-0. **Исправить same-major риски:** `atthasmissing`, virtual generated, проверка
-   checksum на source, отказ для enum/OID-типов, сверка `collversion`. Плюс
-   явный отказ при разных major (чтобы README стал правдой).
-1. **Handshake и manifest v2** с правилом «только same major», но уже с полной
-   информацией о source.
+0. **Исправить оставшиеся same-major риски:** `atthasmissing`, virtual generated,
+   проверка checksum на source, отказ для enum/OID-типов, сверка `collversion`.
+   Явный отказ при разных major уже реализован.
+1. **Дополнить handshake** недостающими physical prerequisites и расширить
+   manifest без введения независимой версии формата.
 2. **Инварианты страниц и туплов** на source и target.
 3. **Безопасность типов:** рекурсивный whitelist и отказ для системных
    composite/`information_schema`.
@@ -187,9 +177,11 @@ checksum-режим). Нужен update script расширения. Обе ст
 
 ## Definition of Done
 
-- [ ] Несовместимый source отклоняется **до** `VACUUM (FREEZE)`/lock/checkpoint
-      с понятным сообщением (major, `BLCKSZ`, `MAXALIGN`, endianness, сжатие).
-- [ ] Downgrade и major вне матрицы отклоняются.
+- [x] Несовместимые major и текущие physical prerequisites отклоняются **до**
+      `VACUUM (FREEZE)`/lock/checkpoint с понятным сообщением.
+- [ ] Дополнительные prerequisites (TOAST chunk, `NAMEDATALEN`, сжатие)
+      проверяются до побочных эффектов.
+- [x] Downgrade и major вне матрицы отклоняются.
 - [ ] BDD-образ с двумя разными major-версиями; сценарии 16→17, 16→18, 17→18:
       heap, external TOAST, NULL, dropped columns, btree lookup и
       index-only scan, auto-create target.

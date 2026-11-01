@@ -1,4 +1,6 @@
+use super::ffi;
 use super::wire::{self, TableSchema};
+use pgrx::{pg_sys, spi::Spi};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 
@@ -31,7 +33,9 @@ unsafe extern "C" {
     ) -> *mut PGresult;
     fn PQresultStatus(result: *const PGresult) -> c_int;
     fn PQntuples(result: *const PGresult) -> c_int;
+    fn PQnfields(result: *const PGresult) -> c_int;
     fn PQgetvalue(result: *const PGresult, row: c_int, column: c_int) -> *mut c_char;
+    fn PQgetisnull(result: *const PGresult, row: c_int, column: c_int) -> c_int;
     fn PQresultErrorMessage(result: *const PGresult) -> *const c_char;
     fn PQclear(result: *mut PGresult);
     fn PQgetCopyData(conn: *mut PGconn, buffer: *mut *mut c_char, async_: c_int) -> c_int;
@@ -42,6 +46,120 @@ unsafe extern "C" {
 pub struct SourceClient {
     conn: *mut PGconn,
     conninfo: String,
+}
+
+#[derive(Clone, Debug)]
+struct ServerInfo {
+    server_version_num: i32,
+    block_size: i32,
+    max_align: i32,
+    endianness: String,
+    server_encoding: String,
+    data_checksums: bool,
+    extension_version: String,
+}
+
+impl ServerInfo {
+    fn local() -> Result<Self, String> {
+        let server_encoding = Spi::get_one::<String>("SELECT current_setting('server_encoding')")
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "target server encoding is NULL".to_owned())?;
+        let extension_version = Spi::get_one::<String>(
+            "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_attach'",
+        )
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "target extension version is missing".to_owned())?;
+        Ok(Self {
+            server_version_num: i32::try_from(pg_sys::PG_VERSION_NUM)
+                .expect("server version fits i32"),
+            block_size: i32::try_from(pg_sys::BLCKSZ).expect("block size fits i32"),
+            max_align: i32::try_from(pg_sys::MAXIMUM_ALIGNOF).expect("alignment fits i32"),
+            endianness: if cfg!(target_endian = "little") {
+                "little"
+            } else {
+                "big"
+            }
+            .to_owned(),
+            server_encoding,
+            data_checksums: ffi::data_checksums_enabled(),
+            extension_version,
+        })
+    }
+
+    fn ensure_compatible(&self, target: &Self) -> Result<(), String> {
+        ensure_equal(
+            "PostgreSQL major",
+            &(self.server_version_num / 10000),
+            &(target.server_version_num / 10000),
+        )?;
+        ensure_equal(
+            "extension version",
+            &self.extension_version,
+            &target.extension_version,
+        )?;
+        ensure_equal("block size", &self.block_size, &target.block_size)?;
+        ensure_equal("max align", &self.max_align, &target.max_align)?;
+        ensure_equal("endianness", &self.endianness, &target.endianness)?;
+        ensure_equal(
+            "server encoding",
+            &self.server_encoding,
+            &target.server_encoding,
+        )?;
+        ensure_equal(
+            "data checksums",
+            &self.data_checksums,
+            &target.data_checksums,
+        )
+    }
+
+    fn decode(result: *mut PGresult) -> Result<Self, String> {
+        let value = |column| -> Result<String, String> {
+            if unsafe { PQgetisnull(result, 0, column) } != 0 {
+                return Err(format!("source server info column {column} is NULL"));
+            }
+            let value = unsafe { CStr::from_ptr(PQgetvalue(result, 0, column)) }
+                .to_str()
+                .map_err(|_| format!("source server info column {column} is not UTF-8"))?;
+            Ok(value.to_owned())
+        };
+        Ok(Self {
+            server_version_num: parse_i32(&value(0)?, "server version")?,
+            block_size: parse_i32(&value(1)?, "block size")?,
+            max_align: parse_i32(&value(2)?, "max align")?,
+            endianness: value(3)?,
+            server_encoding: value(4)?,
+            data_checksums: parse_bool(&value(5)?, "data checksums")?,
+            extension_version: value(6)?,
+        })
+    }
+}
+
+fn ensure_equal<T: PartialEq + std::fmt::Display>(
+    field: &str,
+    source: &T,
+    target: &T,
+) -> Result<(), String> {
+    if source == target {
+        Ok(())
+    } else {
+        Err(format!(
+            "source {field} {source} does not match target {target}"
+        ))
+    }
+}
+
+fn parse_i32(value: &str, field: &str) -> Result<i32, String> {
+    value
+        .parse()
+        .map_err(|_| format!("invalid source {field}: {value}"))
+}
+
+fn parse_bool(value: &str, field: &str) -> Result<bool, String> {
+    match value {
+        "t" => Ok(true),
+        "f" => Ok(false),
+        _ => Err(format!("invalid source {field}: {value}")),
+    }
 }
 
 fn strip_copy_file_header(row: &[u8]) -> Result<&[u8], String> {
@@ -162,6 +280,45 @@ impl SourceClient {
         };
         unsafe { PQclear(result) };
         text
+    }
+
+    fn server_info(&mut self) -> Result<ServerInfo, String> {
+        let result = unsafe {
+            PQexec(
+                self.conn,
+                c"SELECT server_version_num, block_size, max_align, endianness, server_encoding, data_checksums, extension_version FROM pg_attach_server_info()"
+                    .as_ptr(),
+            )
+        };
+        if result.is_null() {
+            return Err(self.error());
+        }
+        let info = (|| {
+            if unsafe { PQresultStatus(result) } != PGRES_TUPLES_OK {
+                let message = unsafe { CStr::from_ptr(PQresultErrorMessage(result)) }
+                    .to_string_lossy()
+                    .trim()
+                    .to_owned();
+                return Err(if message.is_empty() {
+                    self.error()
+                } else {
+                    message
+                });
+            }
+            if unsafe { PQntuples(result) } != 1 || unsafe { PQnfields(result) } != 7 {
+                return Err("source server info must return one row with seven columns".to_owned());
+            }
+            ServerInfo::decode(result)
+        })();
+        unsafe { PQclear(result) };
+        info
+    }
+
+    pub fn check_compatibility(&mut self) -> Result<(), String> {
+        let source = self
+            .server_info()
+            .map_err(|error| format!("source compatibility check failed: {error}"))?;
+        source.ensure_compatible(&ServerInfo::local()?)
     }
 
     /// Freeze, lock and validate before checkpointing from a second backend.
@@ -341,7 +498,97 @@ impl Drop for SourceClient {
 
 #[cfg(test)]
 mod tests {
-    use super::copy_binary_payload;
+    use super::{copy_binary_payload, ServerInfo};
+
+    fn server_info() -> ServerInfo {
+        ServerInfo {
+            server_version_num: 170_004,
+            block_size: 8192,
+            max_align: 8,
+            endianness: "little".to_owned(),
+            server_encoding: "UTF8".to_owned(),
+            data_checksums: true,
+            extension_version: "0.1.0".to_owned(),
+        }
+    }
+
+    #[test]
+    fn accepts_same_major_with_different_minor() {
+        let target = server_info();
+        let source = ServerInfo {
+            server_version_num: 170_005,
+            ..target.clone()
+        };
+        assert!(source.ensure_compatible(&target).is_ok());
+    }
+
+    #[test]
+    fn rejects_different_major() {
+        let target = server_info();
+        let source = ServerInfo {
+            server_version_num: 180_001,
+            ..target.clone()
+        };
+        let error = source.ensure_compatible(&target).unwrap_err();
+        assert!(error.contains("PostgreSQL major"), "{error}");
+    }
+
+    #[test]
+    fn rejects_extension_mismatch() {
+        let target = server_info();
+        let source = ServerInfo {
+            extension_version: "0.0.0".to_owned(),
+            ..target.clone()
+        };
+        let error = source.ensure_compatible(&target).unwrap_err();
+        assert!(error.contains("extension version"), "{error}");
+    }
+
+    #[test]
+    fn rejects_physical_mismatches() {
+        let target = server_info();
+        let cases = [
+            (
+                "block size",
+                ServerInfo {
+                    block_size: 4096,
+                    ..target.clone()
+                },
+            ),
+            (
+                "max align",
+                ServerInfo {
+                    max_align: 4,
+                    ..target.clone()
+                },
+            ),
+            (
+                "endianness",
+                ServerInfo {
+                    endianness: "big".to_owned(),
+                    ..target.clone()
+                },
+            ),
+            (
+                "server encoding",
+                ServerInfo {
+                    server_encoding: "SQL_ASCII".to_owned(),
+                    ..target.clone()
+                },
+            ),
+            (
+                "data checksums",
+                ServerInfo {
+                    data_checksums: false,
+                    ..target.clone()
+                },
+            ),
+        ];
+        for (field, source) in cases {
+            let error = source.ensure_compatible(&target).unwrap_err();
+            assert!(error.contains(field), "{error}");
+        }
+    }
 
     #[test]
     fn extracts_bytea_from_copy_envelope() {

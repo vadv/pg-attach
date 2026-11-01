@@ -120,6 +120,8 @@ SQL pg_attach_import
   │
   └─ importer::import
       ├─ SourceClient::connect                  PQconnectdb
+      ├─ SourceClient::check_compatibility
+      │   └─ pg_attach_server_info              extension, major, physical ABI
       ├─ SourceClient::prepare_direct
       │   ├─ VACUUM (FREEZE)
       │   ├─ BEGIN + pg_attach_lock_source      ACCESS EXCLUSIVE
@@ -138,6 +140,12 @@ SQL pg_attach_import
       ├─ ImportState::finish                    WAL full pages или fsync
       └─ source.commit                          снятие source lock
 ```
+
+Handshake — первый и единственный запрос до побочных эффектов. Target требует
+одинаковые `extension_version`, PostgreSQL major и физические параметры. При
+отсутствии функции или несовпадении соединение закрывается до `VACUUM` и locks.
+Версия расширения — единственная версия совместимости pg_attach; независимых
+версий wire и schema descriptor нет.
 
 Дальше разберём каждую фазу.
 
@@ -222,8 +230,9 @@ Lock уже удерживается, поэтому новые dirty pages эт
 - определения btree-индексов без привязки к исходным именам таблицы и индекса.
 
 Это не `pg_dump` и не SQL-скрипт: по проводу передаётся бинарный descriptor с
-magic `PGAS` и версией формата (`src/pg_attach/wire.rs:205`). Target декодирует
-его в `SourceClient::schema`.
+magic `PGAS`, zero flags и данными схемы (`src/pg_attach/wire.rs:205`). Target
+декодирует его в `SourceClient::schema`. Независимой версии формата нет:
+совместимость гарантирует совпадение `extension_version` в handshake.
 
 ### Если target отсутствует
 
@@ -311,10 +320,14 @@ COPY (
 
 Собственный протокол (`src/pg_attach/wire.rs`) содержит:
 
-- первый пакет `PGAT`, версия 1 и manifest;
+- первый пакет: `PGAT` (4 байта), `flags:u16 = 0`, `manifest_length:u32`,
+  затем manifest; размер заголовка — 10 байтов;
 - page packet: `relation:u16`, `fork:u8`, flags, `block:u32`, `length:u32`;
 - ровно 8192 байта page payload;
 - терминатор из четырёх нулевых байтов.
+
+Независимой версии у PGAT нет: совместимость обеспечивает handshake по
+`extension_version`. MAGIC, flags, lengths и строгий разбор manifest сохранены.
 
 В текущем протоколе размер страницы зафиксирован на 8 KiB. Временный staging-файл
 не создаётся: страницы обрабатываются потоком, а память ограничена текущими
