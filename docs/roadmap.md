@@ -188,7 +188,7 @@ SMGR page I/O и WAL/fsync. Дальнейшие сокращения:
 
 ## Не входит автоматически
 
-Cross-major upgrade, online без freeze, merge в непустую таблицу, автоматическое
+Cross-major upgrade (план и риски — в `docs/cross-version-roadmap.md`), online без freeze, merge в непустую таблицу, автоматическое
 создание произвольных index AM и production failover — отдельные проекты, а не
 побочный эффект добавления одного index type. ACL, ownership, grants, roles и
 privileges пока сознательно не переносятся (out of scope).
