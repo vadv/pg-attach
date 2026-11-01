@@ -91,7 +91,14 @@ esac
 T1=$(date +%s.%N)
 # flush dirty pages so writeback is fully counted; outside the wall window
 if [ "$TWO_INSTANCE" = 1 ]; then psql_b -c "CHECKPOINT;" >/dev/null; else psql_a -c "CHECKPOINT;" >/dev/null; fi
-sync; sleep 2
+sync
+# wait until block-layer write counters stop moving (writeback settled)
+prev=-1; stable=0; waited=0
+while [ $stable -lt 2 ] && [ $waited -lt 300 ]; do
+  cur=$(awk '{w+=substr($3,8)+0} END{print w+0}' /sys/fs/cgroup/io.stat)
+  if [ "$cur" = "$prev" ]; then stable=$((stable+1)); else stable=0; fi
+  prev=$cur; sleep 2; waited=$((waited+2))
+done
 IO2=$(snap_io); CPU2=$(snap_cpu); LSN2=$(snap_lsn)
 
 ROWS_SRC=$(psql_a -c "select count(*) from public.$TABLE")
