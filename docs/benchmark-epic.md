@@ -23,12 +23,13 @@
 
 ## Варианты замера
 
-1. **`pg_stat_io`** (основной, PG16–18): `reads/read_bytes`,
-   `writes/write_bytes`, `extends/extend_bytes` по `backend_type` и `context`
-   (`normal`/`bulkread`/`bulkwrite`). Считает именно I/O PostgreSQL, включая
-   direct-чтения pg_attach через smgr. Snapshot до/после + `pg_stat_reset()`.
-   Ограничение: не видит I/O мимо SMGR — проверить на runtime, что smgr-чтения
-   pg_attach попадают в счётчик.
+1. **`pg_stat_io`** (основной для COPY-пути, PG16–18): `reads`,
+   `writes`, `extends` по `backend_type` и `context`
+   (`normal`/`bulkread`/`bulkwrite`). Байты: в PG18 есть прямые колонки
+   `read_bytes`/`write_bytes`/`extend_bytes`; в PG16–17 — `count ×
+   op_bytes`. Snapshot до/после + `pg_stat_reset()`.
+   ⚠ Проверено по исходникам: счётчики живут в bufmgr, поэтому прямые
+   `smgrread`/`smgrwrite` pg_attach в `pg_stat_io` не попадают.
 2. **WAL-байты**: `pg_current_wal_lsn()` до/после метода. Точно и дёшево.
    Разница no-WAL против WAL-режима — ключевая демонстрация.
 3. **CPU**: cgroup v2 `/sys/fs/cgroup/cpu.stat` (`usage_usec`,
@@ -38,7 +39,18 @@
 4. **Wall time**: `clock_timestamp()` обёрткой вокруг метода.
 5. **Дополнительно** (по желанию): `track_io_timing=on` для времени ожидания
    I/O; `EXPLAIN (ANALYZE, BUFFERS)` на фазе `CREATE INDEX` COPY-пути, чтобы
-   показать CPU-стоимость построения индекса отдельно.
+   показать CPU-стоимость построения индекса отдельно; cgroup `io.stat`
+   (блочный уровень) как перекрёстная проверка при cold cache.
+
+## Источники метрик по методам
+
+| Метрика | COPY-путь | pg_attach |
+| --- | --- | --- |
+| Чтения (байты/страницы) | `pg_stat_io` reads | манифест: страницы heap+TOAST+indexes × 8K (детерминировано; логируется расширением) |
+| Записи (байты/страницы) | `pg_stat_io` writes/extends | манифест: те же страницы × 8K |
+| WAL | LSN до/после | LSN до/после (no-WAL режим ≈ 0) |
+| CPU | cgroup `cpu.stat` | cgroup `cpu.stat` |
+| Wall | `clock_timestamp()` | `clock_timestamp()` |
 
 ## Датасет
 
