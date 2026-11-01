@@ -79,7 +79,7 @@ Feature: Local table clone inside a single database
       CREATE TABLE public.self (id integer PRIMARY KEY);
       INSERT INTO public.self VALUES (1);
       """
-    When the following SQL on "target" fails with "must differ from the source table":
+    Then the following SQL on "target" fails with "must differ from the source table":
       """
       SELECT pg_attach_import_local('public.self', 'public.self', true);
       """
