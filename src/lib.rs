@@ -63,12 +63,25 @@ pub mod pg_attach {
             name!(extension_version, String),
         ),
     > {
-        let server_encoding = Spi::get_one::<String>("SELECT current_setting('server_encoding')")
-            .unwrap_or_else(|error| panic!("pg_attach: cannot read server encoding: {error}"))
-            .unwrap_or_else(|| panic!("pg_attach: server encoding is NULL"));
-        let extension_version = Spi::get_one::<String>(
-            "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_attach'",
-        )
+        // Read-only SPI avoids assigning an XID before the source VACUUM.
+        let server_encoding = Spi::connect(|client| {
+            client
+                .select("SELECT current_setting('server_encoding')", Some(1), &[])?
+                .first()
+                .get_one::<String>()
+        })
+        .unwrap_or_else(|error| panic!("pg_attach: cannot read server encoding: {error}"))
+        .unwrap_or_else(|| panic!("pg_attach: server encoding is NULL"));
+        let extension_version = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_attach'",
+                    Some(1),
+                    &[],
+                )?
+                .first()
+                .get_one::<String>()
+        })
         .unwrap_or_else(|error| panic!("pg_attach: cannot read extension version: {error}"))
         .unwrap_or_else(|| panic!("pg_attach: extension version is missing"));
         let endianness = if cfg!(target_endian = "little") {

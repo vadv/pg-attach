@@ -61,12 +61,25 @@ struct ServerInfo {
 
 impl ServerInfo {
     fn local() -> Result<Self, String> {
-        let server_encoding = Spi::get_one::<String>("SELECT current_setting('server_encoding')")
-            .map_err(|error| error.to_string())?
-            .ok_or_else(|| "target server encoding is NULL".to_owned())?;
-        let extension_version = Spi::get_one::<String>(
-            "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_attach'",
-        )
+        // Keep target compatibility reads from assigning an XID.
+        let server_encoding = Spi::connect(|client| {
+            client
+                .select("SELECT current_setting('server_encoding')", Some(1), &[])?
+                .first()
+                .get_one::<String>()
+        })
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "target server encoding is NULL".to_owned())?;
+        let extension_version = Spi::connect(|client| {
+            client
+                .select(
+                    "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_attach'",
+                    Some(1),
+                    &[],
+                )?
+                .first()
+                .get_one::<String>()
+        })
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "target extension version is missing".to_owned())?;
         Ok(Self {
@@ -508,7 +521,7 @@ mod tests {
             endianness: "little".to_owned(),
             server_encoding: "UTF8".to_owned(),
             data_checksums: true,
-            extension_version: "0.1.0".to_owned(),
+            extension_version: "0.2.0".to_owned(),
         }
     }
 

@@ -1,5 +1,5 @@
 comment = 'Physical table transfer between matching PostgreSQL 17 clusters'
-default_version = '0.1.0'
+default_version = '0.2.0'
 module_pathname = '$libdir/pg_attach'
 relocatable = false
 superuser = true

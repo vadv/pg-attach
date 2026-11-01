@@ -30,6 +30,15 @@ Feature: Transfer validation and failure isolation
              extension_version = (SELECT extversion FROM pg_extension WHERE extname = 'pg_attach')
       FROM pg_attach_server_info();
       """
+    And the following SQL on "target" returns "t":
+      """
+      WITH server_info AS MATERIALIZED (
+        SELECT server_version_num, catversion, block_size, max_align,
+               endianness, server_encoding, data_checksums, extension_version
+        FROM pg_attach_server_info()
+      )
+      SELECT txid_current_if_assigned() IS NULL FROM server_info;
+      """
 
   Scenario: Missing source server info leaves destination unchanged
     When the following SQL is executed on "source":
@@ -114,6 +123,101 @@ Feature: Transfer validation and failure isolation
       | check             | source_version                  | source_extension       | error             |
       | PostgreSQL major  | info.server_version_num + 10000 | info.extension_version | PostgreSQL major  |
       | extension version | info.server_version_num         | '0.0.0'::text          | extension version |
+
+  Scenario: Empty source server info leaves destination unchanged
+    When the following SQL is executed on "source":
+      """
+      INSERT INTO public.events VALUES (1, 'source', 'new');
+      ALTER FUNCTION pg_attach_server_info() RENAME TO pg_attach_server_info_original;
+      CREATE FUNCTION pg_attach_server_info()
+      RETURNS TABLE (
+        server_version_num integer,
+        catversion integer,
+        block_size integer,
+        max_align integer,
+        endianness text,
+        server_encoding text,
+        data_checksums boolean,
+        extension_version text
+      ) LANGUAGE SQL AS $$
+        SELECT info.server_version_num, info.catversion, info.block_size, info.max_align,
+               info.endianness, info.server_encoding, info.data_checksums, info.extension_version
+        FROM pg_attach_server_info_original() AS info
+        WHERE false;
+      $$;
+      """
+    And the following SQL is executed on "target":
+      """
+      CREATE TABLE public.events (
+        id bigint PRIMARY KEY,
+        payload text,
+        note text
+      );
+      INSERT INTO public.events VALUES (42, 'keep', 'old');
+      """
+    Then the following SQL on "target" fails with "source compatibility check failed: source server info must return one row with seven columns":
+      """
+      SELECT pg_attach_import(
+        'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
+        'public.events', 'public.events', true
+      );
+      """
+    Then the following SQL on "target" returns "1|42|keep":
+      """
+      SELECT count(*), min(id), min(payload) FROM public.events;
+      """
+    And the following SQL on "source" returns "0|0":
+      """
+      SELECT vacuum_count, autovacuum_count FROM pg_stat_user_tables
+      WHERE relid = 'public.events'::regclass;
+      """
+
+  Scenario: NULL source server info field leaves destination unchanged
+    When the following SQL is executed on "source":
+      """
+      INSERT INTO public.events VALUES (1, 'source', 'new');
+      ALTER FUNCTION pg_attach_server_info() RENAME TO pg_attach_server_info_original;
+      CREATE FUNCTION pg_attach_server_info()
+      RETURNS TABLE (
+        server_version_num integer,
+        catversion integer,
+        block_size integer,
+        max_align integer,
+        endianness text,
+        server_encoding text,
+        data_checksums boolean,
+        extension_version text
+      ) LANGUAGE SQL AS $$
+        SELECT info.server_version_num, info.catversion, info.block_size, info.max_align,
+               info.endianness, info.server_encoding, info.data_checksums, NULL::text
+        FROM pg_attach_server_info_original() AS info;
+      $$;
+      """
+    And the following SQL is executed on "target":
+      """
+      CREATE TABLE public.events (
+        id bigint PRIMARY KEY,
+        payload text,
+        note text
+      );
+      INSERT INTO public.events VALUES (42, 'keep', 'old');
+      """
+    Then the following SQL on "target" fails with "source compatibility check failed: source server info column 6 is NULL":
+      """
+      SELECT pg_attach_import(
+        'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
+        'public.events', 'public.events', true
+      );
+      """
+    Then the following SQL on "target" returns "1|42|keep":
+      """
+      SELECT count(*), min(id), min(payload) FROM public.events;
+      """
+    And the following SQL on "source" returns "0|0":
+      """
+      SELECT vacuum_count, autovacuum_count FROM pg_stat_user_tables
+      WHERE relid = 'public.events'::regclass;
+      """
 
   Scenario: Incompatible table layout leaves destination unchanged
     When the following SQL is executed on "source":
