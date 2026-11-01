@@ -11,12 +11,12 @@ case "$SIZE" in
 esac
 case "$TABLE" in events|metrics) ;; *) echo "bad table $TABLE" >&2; exit 1 ;; esac
 case "$METHOD" in
-  attach-local-nowal|attach-local-wal|attach-network|copy-text|copy-binary) ;;
+  attach-local-nowal|attach-local-wal|attach-network|copy-text|copy-binary|dump-text|dump-fc) ;;
   *) echo "bad method $METHOD" >&2; exit 1 ;;
 esac
 
 TWO_INSTANCE=0
-case "$METHOD" in attach-network|copy-*) TWO_INSTANCE=1 ;; esac
+case "$METHOD" in attach-network|copy-*|dump-*) TWO_INSTANCE=1 ;; esac
 
 GA=/tmp/dga GB=/tmp/dgb SA=/tmp/socka SB=/tmp/sockb
 mkdir -p $SA $SB
@@ -47,6 +47,9 @@ case "$TABLE" in
     COPYCOLS="id,ts,val,tag"; DSTIDX="ts" ;;
 esac
 
+DSTNAME="public.${TABLE}_copy"
+case "$METHOD" in dump-*) DSTNAME="public.$TABLE" ;; esac
+
 if [ "$TWO_INSTANCE" = 1 ]; then
   psql_b -c "CREATE EXTENSION pg_attach;"
   case "$METHOD" in
@@ -60,7 +63,7 @@ fi
 
 case "$TABLE" in
   events)
-    psql_a -c "INSERT INTO public.$TABLE SELECT g, repeat(md5(g::text||'seed'),320), CASE WHEN g%3=0 THEN NULL ELSE 'note-'||(g%100) END FROM generate_series(1,$ROWS) g;" ;;
+    psql_a -c "INSERT INTO public.$TABLE SELECT g, (SELECT string_agg(md5(i::text||chr(58)||g::text),chr(32)) FROM generate_series(1,315) i), CASE WHEN g%3=0 THEN NULL ELSE 'note-'||(g%100) END FROM generate_series(1,$ROWS) g;" ;;
   metrics)
     psql_a -c "INSERT INTO public.$TABLE SELECT g, '2024-01-01'::timestamptz + (g||' seconds')::interval, (g%1000)::float8/7, 'tag-'||(g%50) FROM generate_series(1,$ROWS) g;" ;;
 esac
@@ -76,9 +79,10 @@ IO1=$(snap_io); CPU1=$(snap_cpu); LSN1=$(snap_lsn)
 T0=$(date +%s.%N)
 
 case "$METHOD" in
-  attach-local-nowal) psql_a -c "SELECT pg_attach_import_local('public.$TABLE','public.${TABLE}_copy',false);" >/dev/null ;;
-  attach-local-wal)   psql_a -c "SELECT pg_attach_import_local('public.$TABLE','public.${TABLE}_copy',true);" >/dev/null ;;
-  attach-network)     psql_b -c "SELECT pg_attach_import('host=$SA port=$PA dbname=postgres user=postgres','public.$TABLE','public.${TABLE}_copy',true);" >/dev/null ;;
+case "$METHOD" in
+  attach-local-nowal) psql_a -c "SELECT pg_attach_import_local('public.$TABLE','public.${TABLE}_copy',false);" >/dev/null; psql_a -c "ANALYZE $DSTNAME" >/dev/null ;;
+  attach-local-wal)   psql_a -c "SELECT pg_attach_import_local('public.$TABLE','public.${TABLE}_copy',true);" >/dev/null; psql_a -c "ANALYZE $DSTNAME" >/dev/null ;;
+  attach-network)     psql_b -c "SELECT pg_attach_import('host=$SA port=$PA dbname=postgres user=postgres','public.$TABLE','public.${TABLE}_copy',true);" >/dev/null; psql_b -c "ANALYZE $DSTNAME" >/dev/null ;;
   copy-text|copy-binary)
     FMT=text; [ "$METHOD" = copy-binary ] && FMT=binary
     psql_a -c "COPY (SELECT $COPYCOLS FROM public.$TABLE) TO STDOUT (FORMAT $FMT)" \
@@ -86,6 +90,14 @@ case "$METHOD" in
     psql_b -c "ALTER TABLE public.${TABLE}_copy ADD PRIMARY KEY (id);" \
               -c "CREATE INDEX ON public.${TABLE}_copy($DSTIDX);" \
               -c "ANALYZE public.${TABLE}_copy;" >/dev/null ;;
+  dump-text)
+    pg_dump -h $SA -p $PA -U postgres -d postgres -t public.$TABLE \
+      | psql -h $SB -p $PB -U postgres -d postgres -q >/dev/null
+    psql_b -c "ANALYZE $DSTNAME" >/dev/null ;;
+  dump-fc)
+    pg_dump -h $SA -p $PA -U postgres -d postgres -Fc -f /tmp/d.dump -t public.$TABLE
+    pg_restore -h $SB -p $PB -U postgres -d postgres -j 4 --no-owner /tmp/d.dump >/dev/null
+    psql_b -c "ANALYZE $DSTNAME" >/dev/null ;;
 esac
 
 T1=$(date +%s.%N)
@@ -104,8 +116,8 @@ IO2=$(snap_io); CPU2=$(snap_cpu); LSN2=$(snap_lsn)
 ROWS_SRC=$(psql_a -c "select count(*) from public.$TABLE")
 CHK_SRC=$(psql_a -c "select $CHK from public.$TABLE")
 if [ "$TWO_INSTANCE" = 1 ]; then Q="-h $SB -p $PB"; else Q="-h $SA -p $PA"; fi
-ROWS_DST=$(psql $Q -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -c "select count(*) from public.${TABLE}_copy")
-CHK_DST=$(psql $Q -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -c "select $CHK from public.${TABLE}_copy")
+ROWS_DST=$(psql $Q -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -c "select count(*) from $DSTNAME")
+CHK_DST=$(psql $Q -U postgres -d postgres -qAt -v ON_ERROR_STOP=1 -c "select $CHK from $DSTNAME")
 
 read -r r1a r1b r1c r1d <<EOF2
 $IO1

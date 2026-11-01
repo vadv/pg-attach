@@ -1,0 +1,24 @@
+name: benchmark
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [benchmark-epic]
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build images
+        run: |
+          docker build --build-arg PG_VERSION=17 -t pg-attach-pg17:dev .
+          docker build -f tests/bdd/Dockerfile --build-arg PG_VERSION=17 -t pg-attach-bdd-pg17:dev .
+      - name: Run benchmark (blackbox cgroup IO counters, real Linux kernel)
+        run: PG_VERSION=17 SIZES="m" REPEATS=3 ./benchmark/run.sh
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: benchmark-results
+          path: target/benchmark/

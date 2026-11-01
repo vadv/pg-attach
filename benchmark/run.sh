@@ -7,6 +7,7 @@ PG_VERSION=${PG_VERSION:-17}
 SIZES=${SIZES:-"m l"}
 TABLES=${TABLES:-"events metrics"}
 REPEATS=${REPEATS:-3}
+METHODS=${METHODS:-"attach-local-nowal attach-local-wal attach-network copy-text copy-binary dump-text dump-fc"}
 root=$(CDPATH= cd "$(dirname "$0")/.." && pwd)
 image="pg-attach-bdd-pg${PG_VERSION}:dev"
 out="$root/target/benchmark/results-$PG_VERSION.csv"
@@ -15,7 +16,7 @@ echo "table,size,method,repeat,wall_s,cpu_s,rbytes,wbytes,rios,wios,lsn_bytes,ro
 
 for table in $TABLES; do
   for size in $SIZES; do
-    for method in attach-local-nowal attach-local-wal attach-network copy-text copy-binary; do
+    for method in $METHODS; do
       i=1
       while [ "$i" -le "$REPEATS" ]; do
         echo "== $table $size $method run $i" >&2
