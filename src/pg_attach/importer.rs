@@ -293,7 +293,11 @@ struct TargetRelations {
 
 /// Resolve or create the target table, then open all its relations. The
 /// schema descriptor is only needed when the target has to be created.
-fn open_target(schema: &TableSchema, target_table: &str) -> Result<TargetRelations, String> {
+///
+/// # Safety
+/// Opens relations under ACCESS EXCLUSIVE; callers keep the handles in the
+/// same transaction until commit.
+unsafe fn open_target(schema: &TableSchema, target_table: &str) -> Result<TargetRelations, String> {
     let target_oid = match ffi::resolve_relation(target_table) {
         Ok(oid) => oid,
         Err(_) => {
