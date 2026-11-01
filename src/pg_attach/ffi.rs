@@ -27,9 +27,9 @@ pub unsafe fn self_conninfo() -> Result<String, String> {
     let user = CStr::from_ptr(pg_sys::GetUserNameFromId(pg_sys::GetUserId(), true))
         .to_string_lossy()
         .into_owned();
+    let port = unsafe { *std::ptr::addr_of!(pg_sys::PostPortNumber) };
     Ok(format!(
-        "host={socket} port={} dbname={dbname} user={user}",
-        pg_sys::PostPortNumber
+        "host={socket} port={port} dbname={dbname} user={user}",
     ))
 }
 
