@@ -101,15 +101,15 @@ case "$METHOD" in
       | psql_b -c "COPY public.${TABLE}_copy FROM STDIN (FORMAT $FMT)" >/dev/null
     psql_b -c "ALTER TABLE public.${TABLE}_copy ADD PRIMARY KEY (id);" \
               -c "CREATE INDEX ON public.${TABLE}_copy($DSTIDX);" \
-              -c "ANALYZE public.${TABLE}_copy;" >/dev/null ;;
+              -c "VACUUM (FREEZE, ANALYZE) public.${TABLE}_copy;" >/dev/null ;;
   dump-text)
     pg_dump -h $SA -p $PA -U postgres -d postgres -t public.$TABLE \
       | psql -h $SB -p $PB -U postgres -d postgres -q >/dev/null
-    psql_b -c "ANALYZE $DSTNAME" >/dev/null ;;
+    psql_b -c "VACUUM (FREEZE, ANALYZE) $DSTNAME" >/dev/null ;;
   dump-fc)
     pg_dump -h $SA -p $PA -U postgres -d postgres -Fc -f /tmp/d.dump -t public.$TABLE
     pg_restore -h $SB -p $PB -U postgres -d postgres -j 4 --no-owner /tmp/d.dump >/dev/null
-    psql_b -c "ANALYZE $DSTNAME" >/dev/null ;;
+    psql_b -c "VACUUM (FREEZE, ANALYZE) $DSTNAME" >/dev/null ;;
 esac
 
 T1=$(date +%s.%N)
