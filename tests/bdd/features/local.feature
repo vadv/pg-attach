@@ -46,7 +46,7 @@ Feature: Local table clone inside a single database
       """
       SELECT pg_attach_import_local('public.warm', 'public.warm_copy', false);
       """
-    Then the following SQL on "target" returns "1|one|t":
+    Then the following SQL on "target" returns "1|one|true":
       """
       SELECT (SELECT count(*) FROM public.warm_copy)
           || '|' || (SELECT value FROM public.warm_copy WHERE id = 1)
