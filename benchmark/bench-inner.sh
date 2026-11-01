@@ -73,7 +73,7 @@ sync; sleep 2
 snap_io() {
   local r=0 w=0 ri=0 wi=0 f
   while read -ra fields; do
-    for f in $fields; do
+    for f in "${fields[@]}"; do
       case $f in
         rbytes=*) r=$((r + ${f#rbytes=}));;
         wbytes=*) w=$((w + ${f#wbytes=}));;
@@ -120,7 +120,7 @@ sync
 snap_wbytes() {
   local w=0 f
   while read -ra fields; do
-    for f in $fields; do
+    for f in "${fields[@]}"; do
       case $f in wbytes=*) w=$((w + ${f#wbytes=}));; esac
     done
   done < /sys/fs/cgroup/io.stat
