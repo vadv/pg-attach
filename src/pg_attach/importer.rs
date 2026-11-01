@@ -418,13 +418,14 @@ pub unsafe fn import(
 }
 
 /// Clone a table inside the current database with no client transport.
-/// Freezes, locks and checkpoints the source through a self connection so the
-/// caller only invokes this one function, then installs the pages through the
-/// same pipeline as the network import.
+/// Reuses the network import against this backend's own postmaster: the
+/// self connection runs the freeze/lock/checkpoint retry and streams the
+/// pages, this backend only installs them. Building source metadata here
+/// instead would deadlock against the self connection's ACCESS EXCLUSIVE
+/// lock on the source.
 ///
 /// # Safety
-/// Runs inside PostgreSQL. The self connection holds ACCESS EXCLUSIVE on the
-/// source until the clone finishes; target relations stay locked until commit.
+/// Runs inside PostgreSQL. Emits a NOTICE for the automatic VACUUM (FREEZE).
 pub unsafe fn import_local(
     source_table: &str,
     target_table: &str,
@@ -434,75 +435,12 @@ pub unsafe fn import_local(
     if ffi::resolve_relation(target_table) == Ok(source_oid) {
         return Err("target table must differ from the source table".into());
     }
-    // One-function contract: VACUUM cannot run inside this transaction, so the
-    // freeze/lock/checkpoint dance runs on a separate self connection that
-    // keeps ACCESS EXCLUSIVE until the clone is done. Retry bounds writer races.
     pgrx::notice!("pg_attach: VACUUM (FREEZE) {source_table}");
     pgrx::log!("pg_attach: local clone {source_table} -> {target_table}");
-    let mut self_client = SourceClient::connect(&ffi::self_conninfo()?)?;
-    self_client.prepare_direct(source_table)?;
-    let result = clone_local(source_table, target_table, generate_wal);
-    // Releasing the lock transaction also releases the source table.
-    let released = self_client.rollback();
-    result?;
-    released
-}
-
-/// Page-copy stage of the local clone, run under the self connection's locks.
-unsafe fn clone_local(
-    source_table: &str,
-    target_table: &str,
-    generate_wal: bool,
-) -> Result<(), String> {
-    let source_oid = ffi::resolve_relation(source_table)?;
-    let schema = wire::decode_schema(&exporter::export_schema(source_table)?)
-        .map_err(|error| error.to_string())?;
-    let targets = open_target(&schema, target_table)?;
-    let target_toast_oid = targets.main.toast_oid();
-    let checksums = ffi::data_checksums_enabled();
-    let mut state = prepare_state(
-        exporter::build_manifest(source_table, target_table, target_toast_oid, checksums)?,
+    import(
+        &ffi::self_conninfo()?,
+        source_table,
         target_table,
-        targets.main,
-        targets.toast,
-        targets.indexes,
-        targets.toast_index,
-    )?;
-    // prepare_direct already verified frozen state and ran CHECKPOINT, so
-    // direct smgr reads see the flushed source without further flushing.
-    let relations: Vec<(u32, RelationKind, u8, u32)> = state
-        .manifest
-        .relations
-        .iter()
-        .map(|relation| (relation.oid, relation.kind, relation.fork, relation.blocks))
-        .collect();
-    let source_toast_oid = Rel::open(source_oid, pg_sys::NoLock.cast_signed()).toast_oid();
-    for (index, (oid, kind, fork, blocks)) in relations.into_iter().enumerate() {
-        let relation = Rel::open(pg_sys::Oid::from_u32(oid), pg_sys::NoLock.cast_signed());
-        for block in 0..blocks {
-            let mut page = vec![0u8; ffi::PAGE_SIZE];
-            relation.read_page(MAIN_FORK, block, &mut page);
-            match kind {
-                RelationKind::Main | RelationKind::Toast => relation.prepare_heap_page(
-                    block,
-                    &mut page,
-                    source_toast_oid,
-                    target_toast_oid,
-                    kind == RelationKind::Main && source_toast_oid != pg_sys::Oid::INVALID,
-                    state.manifest.checksums,
-                ),
-                RelationKind::Index => {
-                    Rel::prepare_page(block, &mut page, state.manifest.checksums);
-                }
-            }
-            let packet = wire::PagePacket {
-                relation: u16::try_from(index).map_err(|_| "relation count exceeds u16")?,
-                fork,
-                block,
-                bytes: page,
-            };
-            state.accept(packet)?;
-        }
-    }
-    state.finish(generate_wal)
+        generate_wal,
+    )
 }
