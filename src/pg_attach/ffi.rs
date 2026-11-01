@@ -4,6 +4,19 @@ use std::os::raw::{c_char, c_int};
 
 pub const PAGE_SIZE: usize = pg_sys::BLCKSZ as usize;
 pub const MAIN_FORK: pg_sys::ForkNumber::Type = pg_sys::ForkNumber::MAIN_FORKNUM;
+pub const FSM_FORK: pg_sys::ForkNumber::Type = pg_sys::ForkNumber::FSM_FORKNUM;
+pub const VM_FORK: pg_sys::ForkNumber::Type = pg_sys::ForkNumber::VISIBILITYMAP_FORKNUM;
+
+/// Map the wire fork byte back to a PostgreSQL fork number, rejecting unknown
+/// forks so old or corrupt manifests fail closed.
+pub fn fork_from_wire(fork: u8) -> Result<pg_sys::ForkNumber::Type, String> {
+    for candidate in [MAIN_FORK, FSM_FORK, VM_FORK] {
+        if fork == u8::try_from(candidate).expect("fork number fits u8") {
+            return Ok(candidate);
+        }
+    }
+    Err(format!("unsupported fork number {fork}"))
+}
 
 /// Connection string pointing back at this backend's own postmaster, used to
 /// run VACUUM FREEZE outside the import transaction.
@@ -78,6 +91,10 @@ unsafe extern "C" {
     fn pg_attach_index_definition(index_oid: pg_sys::Oid) -> *const c_char;
     fn pg_attach_attributes(rel: pg_sys::Relation, attrs: *mut RawAttribute);
     fn pg_attach_attribute_count(rel: pg_sys::Relation) -> c_int;
+    fn pg_attach_blocks_safe(
+        rel: pg_sys::Relation,
+        fork: pg_sys::ForkNumber::Type,
+    ) -> pg_sys::BlockNumber;
     fn pg_attach_write_page(
         rel: pg_sys::Relation,
         fork: pg_sys::ForkNumber::Type,
@@ -142,6 +159,13 @@ impl Rel {
 
     pub fn blocks(&self, fork: pg_sys::ForkNumber::Type) -> u32 {
         unsafe { pg_sys::RelationGetNumberOfBlocksInFork(self.0, fork) }
+    }
+
+    /// Size of an optional fork; unlike [`blocks`] this returns 0 instead of
+    /// raising when the fork file does not exist (indexes and fresh tables
+    /// have no FSM/VM files).
+    pub fn blocks_if_exists(&self, fork: pg_sys::ForkNumber::Type) -> u32 {
+        unsafe { pg_attach_blocks_safe(self.0, fork) }
     }
 
     pub fn toast_oid(&self) -> pg_sys::Oid {

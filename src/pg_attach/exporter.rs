@@ -1,8 +1,49 @@
-use super::ffi::{self, Rel, MAIN_FORK, PAGE_SIZE};
+use super::ffi::{self, Rel, FSM_FORK, MAIN_FORK, PAGE_SIZE, VM_FORK};
 use super::wire::{self, Manifest, Relation, RelationKind, SchemaColumn, SchemaIndex, TableSchema};
 use pgrx::iter::SetOfIterator;
 use pgrx::pg_sys;
 use pgrx::spi::Spi;
+
+/// Push the main, FSM and VM entries of one relation: the export protocol
+/// guarantees the source is fully frozen before pages stream, so its visibility
+/// map is exact for the byte-identical destination heap.
+unsafe fn push_relation(
+    relations: &mut Vec<Relation>,
+    oid: pg_sys::Oid,
+    rel: &Rel,
+    kind: RelationKind,
+) {
+    let oid = oid.to_u32();
+    relations.push(Relation {
+        oid,
+        name: rel.name(),
+        kind,
+        fork: u8::try_from(MAIN_FORK).expect("main fork fits in u8"),
+        blocks: rel.blocks(MAIN_FORK),
+        toast_index_oid: 0,
+    });
+    if rel.blocks_if_exists(FSM_FORK) > 0 {
+        relations.push(Relation {
+            oid,
+            name: rel.name(),
+            kind,
+            fork: u8::try_from(FSM_FORK).expect("fsm fork fits in u8"),
+            blocks: rel.blocks(FSM_FORK),
+            toast_index_oid: 0,
+        });
+    }
+    if matches!(kind, RelationKind::Main | RelationKind::Toast) && rel.blocks_if_exists(VM_FORK) > 0
+    {
+        relations.push(Relation {
+            oid,
+            name: rel.name(),
+            kind,
+            fork: u8::try_from(VM_FORK).expect("vm fork fits in u8"),
+            blocks: rel.blocks(VM_FORK),
+            toast_index_oid: 0,
+        });
+    }
+}
 
 pub unsafe fn build_manifest(
     source_table: &str,
@@ -44,14 +85,8 @@ pub unsafe fn build_manifest(
         })
         .collect();
 
-    let mut relations = vec![Relation {
-        oid: source_oid.to_u32(),
-        name: source.name(),
-        kind: RelationKind::Main,
-        fork: u8::try_from(MAIN_FORK).expect("main fork fits in u8"),
-        blocks: source.blocks(MAIN_FORK),
-        toast_index_oid: 0,
-    }];
+    let mut relations = Vec::new();
+    push_relation(&mut relations, source_oid, &source, RelationKind::Main);
 
     if source_toast != pg_sys::Oid::INVALID {
         let toast = Rel::open(source_toast, pg_sys::ShareLock.cast_signed());
@@ -63,22 +98,13 @@ pub unsafe fn build_manifest(
         if !toast_index.is_btree() {
             return Err("source TOAST index is not a supported btree".into());
         }
-        relations.push(Relation {
-            oid: source_toast.to_u32(),
-            name: toast.name(),
-            kind: RelationKind::Toast,
-            fork: u8::try_from(MAIN_FORK).expect("main fork fits in u8"),
-            blocks: toast.blocks(MAIN_FORK),
-            toast_index_oid: toast_index_oid.to_u32(),
-        });
-        relations.push(Relation {
-            oid: toast_index_oid.to_u32(),
-            name: toast_index.name(),
-            kind: RelationKind::Index,
-            fork: u8::try_from(MAIN_FORK).expect("main fork fits in u8"),
-            blocks: toast_index.blocks(MAIN_FORK),
-            toast_index_oid: 0,
-        });
+        push_relation(&mut relations, source_toast, &toast, RelationKind::Toast);
+        push_relation(
+            &mut relations,
+            toast_index_oid,
+            &toast_index,
+            RelationKind::Index,
+        );
     }
 
     let index_oids = source.index_oids();
@@ -88,14 +114,7 @@ pub unsafe fn build_manifest(
         if !index.is_btree() {
             return Err(format!("index {} is not a btree", index.name()));
         }
-        relations.push(Relation {
-            oid: index_oid.to_u32(),
-            name: index.name(),
-            kind: RelationKind::Index,
-            fork: u8::try_from(MAIN_FORK).expect("main fork fits in u8"),
-            blocks: index.blocks(MAIN_FORK),
-            toast_index_oid: 0,
-        });
+        push_relation(&mut relations, index_oid, &index, RelationKind::Index);
         index_definitions.push(ffi::index_definition(index_oid));
     }
 
@@ -310,20 +329,24 @@ impl ExportState {
                     pg_sys::NoLock.cast_signed(),
                 )
             };
+            let fork = ffi::fork_from_wire(metadata.fork)
+                .unwrap_or_else(|error| panic!("pg_attach: {error}"));
             let mut page = vec![0u8; PAGE_SIZE];
-            relation.read_page(MAIN_FORK, self.block, &mut page);
-            match metadata.kind {
-                RelationKind::Main | RelationKind::Toast => relation.prepare_heap_page(
-                    self.block,
-                    &mut page,
-                    self.source_toast_oid,
-                    self.target_toast_oid,
-                    metadata.kind == RelationKind::Main
-                        && self.source_toast_oid != pg_sys::Oid::INVALID,
-                    self.manifest.checksums,
-                ),
-                RelationKind::Index => {
-                    Rel::prepare_page(self.block, &mut page, self.manifest.checksums);
+            relation.read_page(fork, self.block, &mut page);
+            if fork == MAIN_FORK {
+                match metadata.kind {
+                    RelationKind::Main | RelationKind::Toast => relation.prepare_heap_page(
+                        self.block,
+                        &mut page,
+                        self.source_toast_oid,
+                        self.target_toast_oid,
+                        metadata.kind == RelationKind::Main
+                            && self.source_toast_oid != pg_sys::Oid::INVALID,
+                        self.manifest.checksums,
+                    ),
+                    RelationKind::Index => {
+                        Rel::prepare_page(self.block, &mut page, self.manifest.checksums);
+                    }
                 }
             }
             let packet = wire::encode_page(

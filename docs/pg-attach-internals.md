@@ -267,9 +267,12 @@ constraints. Такой target можно попытаться подготов�
 3. TOAST btree index;
 4. пользовательские btree-индексы.
 
-Для каждого relation сохраняются source OID, имя, тип, fork и число блоков.
-Переносится только `MAIN_FORKNUM`. VM и FSM не копируются; статистика planner
-тоже не переносится, поэтому после импорта рекомендуется `VACUUM (ANALYZE)`.
+Для каждого relation сохраняются source OID, имя, тип и число блоков, а
+записи manifest охватывают все переносимые форки: `MAIN`, `VM` и `FSM`
+(последние — только если файл форка существует на source). VM и FSM копируются
+после freeze-валидации и checkpoint, поэтому их состояние соответствует
+переданным heap-страницам; статистика planner не переносится, поэтому после
+импорта рекомендуется `VACUUM (ANALYZE)`.
 
 Поддерживаются только permanent plain heap tables и валидные, ready, non-partial,
 non-exclusion btree (`src/pg_attach/ffi.rs:156`, `src/pg_attach/ffi.rs:165`).
@@ -513,7 +516,8 @@ CPU-работы и index rebuild**, а не с волшебным уменьш�
 - source role может делать `VACUUM FREEZE` и `CHECKPOINT`;
 - допустима `ACCESS EXCLUSIVE` на время freeze-validate-stream;
 - для auto-create нет identity, foreign и exclusion constraints;
-- не требуется перенос ACL, ownership, grants, roles, VM/FSM или statistics;
+- не требуется перенос ACL, ownership, grants, roles или statistics
+  (VM/FSM переносятся вместе с relation);
 - для replicas/PITR используется `generate_wal = true`.
 
 Часть требований проверяется кодом, но не все. Например, совместимость major,

@@ -17,6 +17,21 @@ Feature: Transfer validation and failure isolation
       CREATE EXTENSION pg_attach;
       """
 
+  Scenario: Server info exposes physical and protocol compatibility
+    Then the following SQL on "target" returns "t|t|t|t|t|t|t|t|t":
+      """
+      SELECT server_version_num = current_setting('server_version_num')::integer,
+             catversion > 0,
+             block_size = current_setting('block_size')::integer,
+             max_align > 0,
+             endianness IN ('little', 'big'),
+             server_encoding = current_setting('server_encoding'),
+             data_checksums = current_setting('data_checksums')::boolean,
+             protocol_version = 1,
+             extension_version = (SELECT extversion FROM pg_extension WHERE extname = 'pg_attach')
+      FROM pg_attach_server_info();
+      """
+
   Scenario: Incompatible table layout leaves destination unchanged
     When the following SQL is executed on "source":
       """

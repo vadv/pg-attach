@@ -8,6 +8,7 @@ use std::io::Cursor;
 struct ImportState {
     manifest: Manifest,
     targets: Vec<Rel>,
+    routes: Vec<(usize, pg_sys::ForkNumber::Type)>,
     next_blocks: Vec<u32>,
     done: bool,
 }
@@ -192,25 +193,44 @@ fn prepare_state(
         let (_, index) = target_indexes.remove(position);
         targets.push(index);
     }
-    if targets.len() != manifest.relations.len() {
-        return Err("manifest relation count does not match target".into());
-    }
 
     for target in &targets {
         reset_storage(target);
     }
-    for (relation, target) in manifest.relations.iter().zip(&targets) {
-        if relation.fork != u8::try_from(MAIN_FORK).expect("main fork fits in u8") {
-            return Err("only the main fork is supported".into());
-        }
-        if target.blocks(MAIN_FORK) != 0 {
-            return Err(format!("target relation {} is not empty", target.name()));
+    // Main-fork entries map onto the unique targets in order; every fork entry
+    // rides on the relation of the main entry that precedes it in the manifest.
+    let mut routes = Vec::with_capacity(manifest.relations.len());
+    let mut main_count = 0usize;
+    let mut owner: Option<usize> = None;
+    for relation in &manifest.relations {
+        let fork = ffi::fork_from_wire(relation.fork)?;
+        if fork == MAIN_FORK {
+            if main_count >= targets.len() {
+                return Err("manifest main relations exceed target relations".into());
+            }
+            if targets[main_count].blocks(MAIN_FORK) != 0 {
+                return Err(format!(
+                    "target relation {} is not empty",
+                    targets[main_count].name()
+                ));
+            }
+            routes.push((main_count, MAIN_FORK));
+            owner = Some(main_count);
+            main_count += 1;
+        } else {
+            let owner =
+                owner.ok_or_else(|| "fork entry before its relation main entry".to_string())?;
+            routes.push((owner, fork));
         }
     }
-    let next_blocks = vec![0; targets.len()];
+    if main_count != targets.len() {
+        return Err("manifest relation count does not match target".into());
+    }
+    let next_blocks = vec![0; manifest.relations.len()];
     Ok(ImportState {
         manifest,
         targets,
+        routes,
         next_blocks,
         done: false,
     })
@@ -220,19 +240,24 @@ impl ImportState {
     /// Validate and install one decoded page packet.
     fn accept(&mut self, mut packet: wire::PagePacket) -> Result<(), String> {
         let relation_index = usize::from(packet.relation);
-        if relation_index >= self.targets.len() {
+        if relation_index >= self.routes.len() {
             return Err(format!("invalid relation index {}", packet.relation));
         }
-        if packet.fork != u8::try_from(MAIN_FORK).expect("main fork fits in u8") {
-            return Err("only main-fork packets are supported".into());
+        let metadata = &self.manifest.relations[relation_index];
+        if packet.fork != metadata.fork {
+            return Err(format!(
+                "fork mismatch for relation {}: expected {}, got {}",
+                relation_index, metadata.fork, packet.fork
+            ));
         }
+        let (target_index, fork) = self.routes[relation_index];
         if packet.block != self.next_blocks[relation_index] {
             return Err(format!(
                 "out-of-order block {} for relation {}",
                 packet.block, relation_index
             ));
         }
-        if packet.block >= self.manifest.relations[relation_index].blocks {
+        if packet.block >= metadata.blocks {
             return Err("page exceeds manifest relation length".into());
         }
         // Debug-only corruption hook for the BDD suite: flips one byte of a
@@ -249,18 +274,22 @@ impl ImportState {
                     0xFF;
             }
         }
-        if !Rel::verify_page(packet.block, &mut packet.bytes, self.manifest.checksums) {
+        // Only main-fork pages carry data checksums; VM and FSM pages transfer
+        // byte-exact without verification.
+        if fork == MAIN_FORK
+            && !Rel::verify_page(packet.block, &mut packet.bytes, self.manifest.checksums)
+        {
             return Err(format!(
                 "page verification failed for block {} of relation {}",
                 packet.block, relation_index
             ));
         }
-        self.targets[relation_index].write_page(MAIN_FORK, packet.block, &packet.bytes);
+        self.targets[target_index].write_page(fork, packet.block, &packet.bytes);
         self.next_blocks[relation_index] += 1;
         Ok(())
     }
 
-    /// Complete the stream: WAL or sync every installed relation.
+    /// Complete the stream: WAL or sync every installed relation fork.
     fn finish(&mut self, generate_wal: bool) -> Result<(), String> {
         for (index, relation) in self.manifest.relations.iter().enumerate() {
             if self.next_blocks[index] != relation.blocks {
@@ -270,11 +299,11 @@ impl ImportState {
                 ));
             }
         }
-        for target in &self.targets {
+        for (target_index, fork) in &self.routes {
             if generate_wal {
-                target.log_relation(MAIN_FORK);
+                self.targets[*target_index].log_relation(*fork);
             } else {
-                target.sync_relation(MAIN_FORK);
+                self.targets[*target_index].sync_relation(*fork);
             }
         }
         self.done = true;

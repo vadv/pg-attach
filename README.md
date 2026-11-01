@@ -9,7 +9,7 @@ PoC PostgreSQL extension that freezes and transfers a table between two PostgreS
 - An existing target is fully overwritten and must have identical attributes and btree keys; it may be non-empty and its name may differ.
 - If the target is absent, the extension creates its table/columns, supported constraints and btree indexes from a compact binary schema descriptor. The target name may differ from the source name. Automatic creation currently rejects identity columns and foreign/exclusion constraints; create such a target explicitly first.
 - ACLs, ownership, grants, roles and other privileges are deliberately out of scope and are not transferred.
-- Import runs `VACUUM (FREEZE)` on the source and validates frozen heap/TOAST tuples under lock. No VM copying; run `VACUUM (ANALYZE)` on the target after import.
+- Import runs `VACUUM (FREEZE)` on the source and validates frozen heap/TOAST tuples under lock. Visibility map and free space map forks are transferred with each relation, so index-only scans and free-space reuse start warm; run `VACUUM (ANALYZE)` on the target for planner statistics.
 - No partitions, foreign tables, unlogged tables, non-btree indexes, or cross-version upgrades.
 
 Both instances need the same extension build installed. No background worker or `shared_preload_libraries` entry is needed. The source only serves a `COPY` stream; the target pulls it through libpq. The source role must own the table (or have equivalent VACUUM privileges) and have permission to run `CHECKPOINT` (normally a superuser or a role with `pg_checkpoint`). Heap and TOAST are validated under `ACCESS EXCLUSIVE` before checkpoint using their visibility maps. Only pages without `ALL_FROZEN` need a validation read; all data pages are then read for streaming.
