@@ -221,11 +221,7 @@ impl SourceClient {
     }
 
     /// Roll back the lock transaction, releasing ACCESS EXCLUSIVE on the source.
-    pub fn rollback(&mut self) -> Result<(), String> {
-        self.execute("ROLLBACK")
-    }
-
-    pub fn schema(&mut self, source_table: &str) -> Result<TableSchema, String> {
+(&mut self, source_table: &str) -> Result<TableSchema, String> {
         let literal = format!("'{}'", source_table.replace('\'', "''"));
         let command =
             format!("COPY (SELECT pg_attach_export_schema({literal})) TO STDOUT (FORMAT binary)");
