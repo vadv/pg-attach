@@ -55,10 +55,12 @@ physical attributes. Source и target должны совпасть по:
 
 - имени и порядку атрибутов, typmod, length, alignment, by-value и storage;
 - `attgenerated`, `atthasmissing`, NOT NULL и dropped-разметке;
-- stable type identity, collation identity, `collversion` и actual collation
-  version (включая database-default collation);
+- stable type identity и полной collation ordering identity: resolved
+  schema/name, provider, locale, deterministic flag, encoding, `collversion` и
+  actual version, включая database-default и index collation resolution;
 - структурным btree key/include/opclass/collation/indoption/unique/
-  nulls-not-distinct полям, а не тексту `pg_get_indexdef`;
+  nulls-not-distinct полям, а не тексту `pg_get_indexdef`; разрешены только
+  opclasses из `pg_catalog`, поскольку имена не доказывают семантику сравнения;
 - btree metapage version, `btm_allequalimage` и результату
   `_bt_allequalimage()` на target.
 
@@ -93,9 +95,9 @@ network, bit strings, geometric types, `pg_lsn`, `tsvector` и `tsquery`.
 - испорченная source-страница или отличающийся checksum mode;
 - non-btree, expression, partial и exclusion indexes.
 
-Автоматическое создание target по-прежнему не поддерживает identity columns и
-foreign/exclusion constraints; такой target можно создать явно, если physical
-manifest совпадает. ACL, ownership, grants, roles и статистика не переносятся.
+Автоматическое создание target не поддерживает identity columns. Foreign и
+exclusion constraints не поддерживаются ни в одном режиме; exclusion indexes
+также отклоняются. ACL, ownership, grants, roles и статистика не переносятся.
 После импорта следует выполнять `VACUUM (ANALYZE)` на target.
 
 ## BDD и Definition of Done

@@ -5,11 +5,11 @@ PoC PostgreSQL extension that freezes and transfers a table between two PostgreS
 ## Scope
 
 - Matching architecture, `BLCKSZ`, alignment, endianness, encoding, TOAST geometry, checksum algorithm and `data_checksums` mode on both sides.
-- Plain logged heap tables and ordinary valid non-partial, non-expression, non-exclusion btree indexes.
+- Plain logged heap tables and ordinary valid non-partial, non-expression, non-exclusion btree indexes with `pg_catalog` opclasses only.
 - An existing target is fully overwritten and must have identical physical attributes, collations and structural btree metadata; it may be non-empty and its name may differ.
-- If the target is absent, the extension creates its table/columns, supported constraints and btree indexes from a compact binary schema descriptor. The target name may differ from the source name. Automatic creation currently rejects identity columns and foreign/exclusion constraints; create such a target explicitly first.
+- If the target is absent, the extension creates its table/columns, supported constraints and btree indexes from a compact binary schema descriptor. The target name may differ from the source name. Automatic creation rejects identity columns. Foreign and exclusion constraints are unsupported in every mode; exclusion indexes are also rejected.
 - Only whitelisted built-in types without catalog OIDs in their values, and arrays of those types. Enum, `reg*`, OID/oidvector, aclitem, composite/range/domain and extension-defined types are rejected.
-- Fast defaults/missing values and virtual generated columns are rejected. Stored/actual collation versions must match; actual lz4 values are rejected if the target lacks lz4 support.
+- Fast defaults/missing values and virtual generated columns are rejected. Complete collation ordering identity must match: resolved name, provider, locale, deterministic flag, encoding, and stored/actual versions. Actual lz4 values are rejected if the target lacks lz4 support.
 - ACLs, ownership, grants, roles and other privileges are deliberately out of scope and are not transferred.
 - Import runs `VACUUM (FREEZE)` on the source and validates frozen heap/TOAST tuples under lock. Visibility map and free space map forks are transferred with each relation, so index-only scans and free-space reuse start warm; run `VACUUM (ANALYZE)` on the target for planner statistics.
 - No partitions, foreign tables, unlogged tables, non-btree indexes, downgrades, differing checksum modes, or on-the-fly tuple conversion.

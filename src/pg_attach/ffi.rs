@@ -261,8 +261,16 @@ impl Rel {
             let rows = client.select(
                 "SELECT CASE WHEN t.oid IS NULL OR tn.oid IS NULL THEN '' \
                       ELSE format('%I.%I', tn.nspname, t.typname) END, \
-                 CASE WHEN a.attcollation = 0 OR c.oid IS NULL OR cn.oid IS NULL THEN NULL \
-                      ELSE format('%I.%I', cn.nspname, c.collname) END, \
+                 CASE WHEN a.attcollation = 0 OR (c.oid IS NULL AND dc.oid IS NULL) THEN NULL \
+                      ELSE format('%I.%I|%s|%s|%s|%s|%s', \
+                       coalesce(dcn.nspname, cn.nspname), coalesce(dc.collname, c.collname), \
+                       coalesce(dc.collprovider, c.collprovider), \
+                       coalesce(row_to_json(dc)->>'colllocale', row_to_json(dc)->>'colliculocale', \
+                                dc.collcollate, row_to_json(c)->>'colllocale', \
+                                row_to_json(c)->>'colliculocale', c.collcollate), \
+                       coalesce(dc.collctype, c.collctype, ''), \
+                       coalesce(dc.collisdeterministic, c.collisdeterministic), \
+                       coalesce(dc.collencoding, c.collencoding)) END, \
                  CASE WHEN a.attcollation = 0 THEN '' \
                       ELSE coalesce(c.collversion, dc.collversion, '') END, \
                  CASE WHEN a.attcollation = 0 THEN '' ELSE coalesce(\
@@ -274,7 +282,7 @@ impl Rel {
                  LEFT JOIN pg_collation c ON c.oid = a.attcollation \
                  LEFT JOIN pg_namespace cn ON cn.oid = c.collnamespace \
                  LEFT JOIN LATERAL ( \
-                     SELECT dc.collversion, dc.oid FROM pg_database d \
+                     SELECT dc.* FROM pg_database d \
                      JOIN pg_collation dc ON \
                        (dc.collprovider = 'c' AND dc.collname = d.datcollate) OR \
                        (dc.collprovider = 'i' AND dc.collname = coalesce(\
@@ -283,6 +291,7 @@ impl Rel {
                        AND dc.collencoding IN (-1, pg_char_to_encoding(current_setting('server_encoding'))) \
                      ORDER BY (dc.collprovider = 'i') DESC, dc.oid LIMIT 1 \
                  ) dc ON true \
+                 LEFT JOIN pg_namespace dcn ON dcn.oid = dc.collnamespace \
                  WHERE a.attrelid = $1 AND a.attnum > 0 ORDER BY a.attnum",
                 None,
                 &[self.1.into()],
@@ -438,22 +447,55 @@ pub fn index_metadata(oid: pg_sys::Oid) -> Result<wire::IndexMetadata, String> {
     if unsupported {
         return Err("expression and partial indexes are not supported".into());
     }
+    let custom_opclass = Spi::get_one_with_args::<bool>(
+        "SELECT EXISTS (SELECT 1 FROM pg_index i \
+         JOIN LATERAL unnest(i.indclass) AS u(oid) ON true \
+         JOIN pg_opclass o ON o.oid = u.oid \
+         JOIN pg_namespace n ON n.oid = o.opcnamespace \
+         WHERE i.indexrelid = $1 AND n.nspname <> 'pg_catalog')",
+        &[oid.into()],
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "index opclass metadata is missing".to_owned())?;
+    if custom_opclass {
+        return Err(
+            "custom opclasses are not supported; only pg_catalog btree opclasses are allowed"
+                .into(),
+        );
+    }
     let shape = Spi::get_one_with_args::<String>(
-        "SELECT format('%s|%s|%s|%s|%s|%s|%s|%s|%s|%s', \
+        "SELECT format('%s|%s|%s|%s|%s|%s|%s|%s', \
            i.indnkeyatts, i.indnatts, i.indisunique, i.indnullsnotdistinct, \
            i.indkey, i.indoption, \
            coalesce((SELECT string_agg(format('%I.%I', n.nspname, o.opcname), ',' ORDER BY u.ord) \
              FROM unnest(i.indclass) WITH ORDINALITY AS u(oid, ord) \
              JOIN pg_opclass o ON o.oid = u.oid JOIN pg_namespace n ON n.oid = o.opcnamespace), ''), \
-           coalesce((SELECT string_agg(format('%I.%I', n.nspname, c.collname), ',' ORDER BY u.ord) \
+           coalesce((SELECT string_agg(format('%I.%I|%s|%s|%s|%s|%s|%s|%s', \
+             coalesce(dcn.nspname, n.nspname), coalesce(dc.collname, c.collname), \
+             coalesce(dc.collprovider, c.collprovider), \
+             coalesce(row_to_json(dc)->>'colllocale', row_to_json(dc)->>'colliculocale', \
+                      dc.collcollate, row_to_json(c)->>'colllocale', \
+                      row_to_json(c)->>'colliculocale', c.collcollate), \
+             coalesce(dc.collctype, c.collctype, ''), \
+             coalesce(dc.collisdeterministic, c.collisdeterministic), \
+             coalesce(dc.collencoding, c.collencoding), \
+             coalesce(dc.collversion, c.collversion, ''), \
+             coalesce(pg_collation_actual_version(dc.oid), \
+                      pg_collation_actual_version(c.oid), '')), ',' ORDER BY u.ord) \
              FROM unnest(i.indcollation) WITH ORDINALITY AS u(oid, ord) \
-             JOIN pg_collation c ON c.oid = u.oid JOIN pg_namespace n ON n.oid = c.collnamespace), ''), \
-           coalesce((SELECT string_agg(coalesce(c.collversion, ''), ',' ORDER BY u.ord) \
-             FROM unnest(i.indcollation) WITH ORDINALITY AS u(oid, ord) \
-             JOIN pg_collation c ON c.oid = u.oid), ''), \
-           coalesce((SELECT string_agg(coalesce(pg_collation_actual_version(c.oid), ''), ',' ORDER BY u.ord) \
-             FROM unnest(i.indcollation) WITH ORDINALITY AS u(oid, ord) \
-             JOIN pg_collation c ON c.oid = u.oid), '')) \
+             JOIN pg_collation c ON c.oid = u.oid \
+             JOIN pg_namespace n ON n.oid = c.collnamespace \
+             LEFT JOIN LATERAL ( \
+               SELECT dc.* FROM pg_database d \
+               JOIN pg_collation dc ON \
+                 (dc.collprovider = 'c' AND dc.collname = d.datcollate) OR \
+                 (dc.collprovider = 'i' AND dc.collname = coalesce(\
+                   row_to_json(d)->>'daticulocale', row_to_json(d)->>'datlocale')) \
+               WHERE d.datname = current_database() AND c.oid = 100 \
+                 AND dc.collencoding IN (-1, pg_char_to_encoding(current_setting('server_encoding'))) \
+               ORDER BY (dc.collprovider = 'i') DESC, dc.oid LIMIT 1 \
+             ) dc ON true \
+             LEFT JOIN pg_namespace dcn ON dcn.oid = dc.collnamespace), '')) \
          FROM pg_index i WHERE i.indexrelid = $1",
         &[oid.into()],
     )

@@ -308,6 +308,7 @@ COPY (
     'public.events',
     'public.events_copy',
     target_toast_oid,
+    target_lz4_supported,
     target_checksums
   )
 ) TO STDOUT (FORMAT binary);

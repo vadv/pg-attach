@@ -128,8 +128,14 @@ pub unsafe fn export_schema(source_table: &str) -> Result<Vec<u8>, String> {
     let columns = Spi::connect_mut(|client| {
         let rows = client
             .select(
-                "SELECT a.attname::text, CASE WHEN a.attisdropped THEN 'text' \
-                 ELSE format_type(a.atttypid, a.atttypmod) END, \
+                "SELECT a.attname::text, CASE WHEN NOT a.attisdropped THEN format_type(a.atttypid, a.atttypmod) \
+                 WHEN a.attlen = -1 AND a.attcollation = 0 THEN 'bytea' \
+                 WHEN a.attlen = -1 THEN 'text' \
+                 WHEN a.attlen = 1 THEN 'boolean' \
+                 WHEN a.attlen = 2 THEN 'smallint' \
+                 WHEN a.attlen = 4 THEN 'integer' \
+                 WHEN a.attlen = 8 THEN 'bigint' \
+                 ELSE 'text' END, \
                  CASE WHEN a.attcollation <> 0 AND a.attcollation <> t.typcollation \
                  THEN (SELECT format('%I.%I', n.nspname, c.collname) \
                        FROM pg_collation c JOIN pg_namespace n ON n.oid = c.collnamespace \
