@@ -23,9 +23,17 @@ RUN cargo pgrx init --pg${PG_VERSION} /usr/lib/postgresql/${PG_VERSION}/bin/pg_c
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs pg_attach.control ./
-# Stub lib: cargo fetch validates the manifest before downloading; the real
-# src/ is copied in the build stage and overwrites this file.
-RUN mkdir -p src && echo '' > src/lib.rs && cargo fetch --locked
+# Stub lib: prebuild the whole dependency graph in dev and release profiles
+# so that later src/ changes recompile only this crate. page_shim.c gets an
+# empty stub because build.rs compiles it via cc; the real src/ is copied in
+# the build stage and overwrites these stubs.
+RUN mkdir -p src \
+    && echo '' > src/lib.rs \
+    && echo '' > src/page_shim.c \
+    && cargo fetch --locked \
+    && cargo build --locked --no-default-features --features "pg${PG_VERSION}" \
+    && cargo clippy --locked --no-default-features --features "pg${PG_VERSION}" -- -D warnings -D clippy::pedantic \
+    && cargo build --locked --no-default-features --features "pg${PG_VERSION}" --release
 
 FROM toolchain AS build
 COPY src ./src

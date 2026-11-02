@@ -12,6 +12,7 @@ root=$(CDPATH= cd "$(dirname "$0")/../.." && pwd)
 # builds from source as before.
 hash_files() {
   cat "$root/Dockerfile" "$root/Cargo.lock" \
+    "$root/.github/workflows/images.yml" \
     | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16
 }
 BUILDER_TAG=$(hash_files)

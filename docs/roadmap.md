@@ -3,13 +3,43 @@
 Статус: research/backlog. Здесь нет обещаний, что перечисленные index AM и
 сценарии уже поддерживаются.
 
+## Must-have приоритеты
+
+Анализ по текущему коду, по убыванию приоритета:
+
+1. **Состояние sequences** — correctness-дефект, не фича. Дескриптор
+   переносит `default_expr` (`pg_get_expr`), identity отвергается
+   (`importer.rs`), но `nextval`-default не отвергается и состояние
+   sequence не переносится: auto-create с serial создаёт таблицу, первый
+   INSERT падает `relation ... does not exist`; явный target оставляет
+   sequence на старом `last_value` → PK-конфликты после переноса. Фикс:
+   переносить `last_value` owned sequences target (`setval` после
+   импорта), в auto-create отвергать `nextval`-дефолты.
+2. **Прогресс переноса** — NOTICE каждые N страниц или прогресс-view в
+   стиле `pg_stat_progress`; на 10GB+ оператор должен видеть ход и ETA.
+3. **Физический перенос partial/expression btree** — сравнение выражений
+   в catalog + существующий page-путь; partial (`WHERE ...`) в реальных
+   схемах — норма.
+4. **Физический перенос остальных AM по максимуму** — GiST/GIN/BRIN/Hash/
+   SP-GiST добивать на уровне страниц, где физически возможно (invariants
+   и recovery-история по каждому AM — ниже). Гибридный режим (heap/TOAST
+   и поддержанные btree физически, остальное — `CREATE INDEX` на target)
+   — только крайний fallback для случаев, где физический перенос
+   невозможен в принципе; он не подменяет физическую работу по AM.
+5. **Partitioned tables** — минимум: перенос отдельных партиций (это
+   обычные таблицы) + задокументированный паттерн цикла; далее атомарное
+   окно на все партиции разом.
+
+Порядок атаки: 1 → 2 → 3 → 4 → 5. Не must: online без freeze, ACL
+(out of scope), DirectIO (оптимизация), PG19 до stable.
+
 ## Матрица совместимости
 
 Поддерживаются same-major PostgreSQL 16–18 и upward physical transfer 16→17,
 16→18, 17→18 для whitelist-типов и simple btree. Page layout, `BLCKSZ`, encoding,
 checksum mode и остальные physical prerequisites должны совпадать; downgrade и
-конвертация tuples запрещены. Точные типы и ограничения описаны в
-`docs/cross-version-roadmap.md`.
+конвертация tuples запрещены. Точные типы и ограничения описаны в разделе
+Scope `README.md`.
 
 - `pg16`, `pg17`, `pg18` — отдельные Cargo features pgrx 0.19.3;
 - каждая сборка выбирает ровно одну feature и соответствующий `pg_config`;
