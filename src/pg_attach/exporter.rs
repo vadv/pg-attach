@@ -341,13 +341,23 @@ pub unsafe fn export_schema(source_table: &str) -> Result<Vec<u8>, String> {
     let sequences = Spi::connect_mut(|client| {
         let mut sequences = Vec::with_capacity(owned.len());
         for (column, oid) in owned {
-            // Numeric oid cast to regclass is safe without identifier quoting.
+            let name = client
+                .select(
+                    "SELECT format('%I.%I', n.nspname, c.relname) \
+                     FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace \
+                     WHERE c.oid = $1",
+                    None,
+                    &[oid.into()],
+                )
+                .map_err(|error| error.to_string())?
+                .next()
+                .ok_or_else(|| format!("owned sequence of column {column} disappeared"))?
+                .get::<String>(1)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("owned sequence of column {column} has no name"))?;
             let rows = client
                 .select(
-                    &format!(
-                        "SELECT last_value, is_called FROM {}::regclass",
-                        oid.to_u32()
-                    ),
+                    &format!("SELECT last_value, is_called FROM {name}"),
                     None,
                     &[],
                 )
