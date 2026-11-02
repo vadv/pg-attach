@@ -32,11 +32,13 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Compute toolchain tag
-        # Same inputs as tests/bdd/run.sh derives locally: Dockerfile +
-        # Cargo.lock + this workflow. A change to any produces a new tag, so
-        # stale builder layers are never reused as cache.
+        # Toolchain identity = Dockerfile + this workflow. Cargo.lock is
+        # deliberately excluded: dep-prebuild layers self-invalidate via their
+        # own `COPY Cargo.lock` instruction, while apt layers must survive
+        # dependency bumps. The builder is re-pushed with --cache-from so a
+        # Cargo.lock change on main only rebuilds the dep layers.
         id: tag
-        run: echo "tag=$(cat Dockerfile Cargo.lock .github/workflows/images.yml | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        run: echo "tag=$(cat Dockerfile .github/workflows/images.yml | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         # ghcr.io auth intermittently times out under GHA load; retry the
@@ -52,26 +54,18 @@ jobs:
           echo "ghcr login failed after 3 attempts" >&2
           exit 1
 
-      - name: Check if builder already exists
-        id: exists
-        run: |
-          image="$REGISTRY/${IMAGE_PREFIX}/builder-pg${{ matrix.pg }}:${{ steps.tag.outputs.tag }}"
-          if docker manifest inspect "$image" > /dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "builder already pushed: $image"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Build and push builder image
-        if: steps.exists.outputs.exists != 'true'
         run: |
           image="$REGISTRY/${IMAGE_PREFIX}/builder-pg${{ matrix.pg }}:${{ steps.tag.outputs.tag }}"
           # BUILDKIT_INLINE_CACHE embeds cache metadata so ci.yml's
           # --cache-from can actually reuse these layers; without it the
           # image exists but restores zero layers and every CI run
-          # reinstalls the toolchain from apt.
+          # reinstalls the toolchain from apt. --cache-from the previous
+          # push of the same tag so unchanged layers (apt, cargo-pgrx)
+          # come from the registry and only dep layers rebuild on a
+          # Cargo.lock change.
           docker build --target toolchain \
+            --cache-from "$image" \
             --build-arg BUILDKIT_INLINE_CACHE=1 \
             --build-arg PG_VERSION=${{ matrix.pg }} \
             -t "$image" .
