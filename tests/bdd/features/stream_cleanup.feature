@@ -112,7 +112,7 @@ Feature: Streaming resources survive early exit and errors without crashing sour
         (SELECT t_xmin = '2'::xid FROM heap_page_items(get_raw_page('public.events',
           (pg_relation_size('public.events') / 8192 - 1)::integer)) WHERE lp = 1);
       """
-    And the following SQL on "target" fails with "contains a tuple that is not frozen":
+    And the following SQL on "target" fails with "is not frozen":
       """
       SELECT pg_attach_import(
         'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',

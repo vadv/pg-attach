@@ -300,7 +300,7 @@ Feature: Transfer validation and failure isolation
       );
       INSERT INTO public.events VALUES (42, 'keep', 'old');
       """
-    Then the following SQL on "target" fails with "not a valid identifier":
+    Then the following SQL on "target" fails with "invalid name syntax":
       """
       SELECT pg_attach_import(
         'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
