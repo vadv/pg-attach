@@ -2,7 +2,10 @@
 
 #include "access/detoast.h"
 #include "access/heapam.h"
+#include "access/heaptoast.h"
 #include "access/htup_details.h"
+#include "access/nbtree.h"
+#include "access/toast_compression.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "access/xlogrecord.h"
@@ -18,17 +21,28 @@
 #include "utils/ruleutils.h"
 #include "utils/regproc.h"
 
-/* C representation shared with wire::Attribute; all fields have fixed widths. */
 typedef struct PgAttachAttribute
 {
     char        name[NAMEDATALEN];
-    Oid         type_oid;
-    Oid         collation_oid;
     int32       typmod;
     int16       len;
+    uint8       align;
+    bool        by_val;
+    uint8       storage;
+    bool        has_missing;
+    uint8       generated;
     bool        not_null;
     bool        dropped;
 } PgAttachAttribute;
+
+typedef struct PgAttachBtreeMetadata
+{
+    uint32      version;
+    bool        all_equal_image;
+    bool        expected_all_equal_image;
+} PgAttachBtreeMetadata;
+
+bool pg_attach_verify_page(Page page, BlockNumber blkno, bool checksums);
 
 Oid
 pg_attach_resolve_relation(const char *name)
@@ -52,6 +66,11 @@ pg_attach_read_page(Relation rel, ForkNumber fork, BlockNumber blkno, char *dst)
     if (!smgrexists(smgr, fork))
         elog(ERROR, "pg_attach: relation fork %d does not exist", fork);
     smgrread(smgr, fork, blkno, dst);
+    if (fork == MAIN_FORKNUM &&
+        !pg_attach_verify_page(dst, blkno, DataChecksumsEnabled()))
+        ereport(ERROR,
+                (errcode(ERRCODE_DATA_CORRUPTED),
+                 errmsg("pg_attach: source page verification failed (checksum/layout) for block %u", blkno)));
 }
 
 bool
@@ -116,7 +135,9 @@ pg_attach_verify_page(Page page, BlockNumber blkno, bool checksums)
         return true;
     }
 
-    if (phdr->pd_lower < SizeOfPageHeaderData ||
+    if (PageGetPageLayoutVersion(page) != PG_PAGE_LAYOUT_VERSION ||
+        PageGetPageSize(page) != BLCKSZ ||
+        phdr->pd_lower < SizeOfPageHeaderData ||
         phdr->pd_lower > phdr->pd_upper ||
         phdr->pd_upper > phdr->pd_special ||
         phdr->pd_special > BLCKSZ ||
@@ -137,10 +158,76 @@ pg_attach_verify_page(Page page, BlockNumber blkno, bool checksums)
     return ok;
 }
 
+bool
+pg_attach_verify_btree_metapage(Page page, bool all_equal_image)
+{
+    BTMetaPageData *metadata;
+
+    if (PageIsNew(page))
+        return false;
+    metadata = BTPageGetMeta(page);
+    return metadata->btm_magic == BTREE_MAGIC &&
+        metadata->btm_version >= BTREE_MIN_VERSION &&
+        metadata->btm_version <= BTREE_VERSION &&
+        metadata->btm_allequalimage == all_equal_image;
+}
+
+void
+pg_attach_btree_metadata(Relation rel, PgAttachBtreeMetadata *metadata)
+{
+    Buffer buffer;
+    Page page;
+    BTMetaPageData *metapage;
+
+    buffer = ReadBuffer(rel, BTREE_METAPAGE);
+    LockBuffer(buffer, BUFFER_LOCK_SHARE);
+    page = BufferGetPage(buffer);
+    if (PageIsNew(page))
+        elog(ERROR, "pg_attach: btree metapage is uninitialized");
+    metapage = BTPageGetMeta(page);
+    if (metapage->btm_magic != BTREE_MAGIC ||
+        metapage->btm_version < BTREE_MIN_VERSION ||
+        metapage->btm_version > BTREE_VERSION)
+        elog(ERROR, "pg_attach: unsupported btree metapage format");
+    metadata->version = metapage->btm_version;
+    metadata->all_equal_image = metapage->btm_allequalimage;
+    metadata->expected_all_equal_image = _bt_allequalimage(rel, false);
+    UnlockReleaseBuffer(buffer);
+}
+
+int
+pg_attach_max_toast_chunk_size(void)
+{
+    return TOAST_MAX_CHUNK_SIZE;
+}
+
+int
+pg_attach_max_identifier_length(void)
+{
+    return NAMEDATALEN - 1;
+}
+
+int
+pg_attach_checksum_algorithm_version(void)
+{
+    return PG_DATA_CHECKSUM_VERSION;
+}
+
+bool
+pg_attach_lz4_supported(void)
+{
+#ifdef USE_LZ4
+    return true;
+#else
+    return false;
+#endif
+}
+
 void
 pg_attach_prepare_heap_page(Page page, Relation rel, BlockNumber blkno,
                             Oid source_toast_oid, Oid target_toast_oid,
-                            bool patch_toast, bool checksums)
+                            bool patch_toast, bool target_lz4_supported,
+                            bool checksums)
 {
     TupleDesc desc = RelationGetDescr(rel);
     Datum *values = NULL;
@@ -153,12 +240,13 @@ pg_attach_prepare_heap_page(Page page, Relation rel, BlockNumber blkno,
     for (offnum = FirstOffsetNumber; offnum <= maxoff; offnum++)
     {
         ItemId itemid;
-        CHECK_FOR_INTERRUPTS();
-        itemid = PageGetItemId(page, offnum);
         HeapTupleHeader header;
         HeapTupleData tuple;
         int attno;
+        int tuple_natts;
 
+        CHECK_FOR_INTERRUPTS();
+        itemid = PageGetItemId(page, offnum);
         if (!ItemIdIsNormal(itemid))
             continue;
 
@@ -169,12 +257,22 @@ pg_attach_prepare_heap_page(Page page, Relation rel, BlockNumber blkno,
                     (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                      errmsg("pg_attach: block %u contains a tuple that is not frozen; rerun VACUUM (FREEZE)", blkno)));
 
+        tuple_natts = HeapTupleHeaderGetNatts(header);
+        if (tuple_natts > desc->natts)
+            ereport(ERROR,
+                    (errcode(ERRCODE_DATA_CORRUPTED),
+                     errmsg("pg_attach: tuple attribute count exceeds target descriptor")));
+        for (attno = tuple_natts; attno < desc->natts; attno++)
+            if (TupleDescAttr(desc, attno)->atthasmissing)
+                ereport(ERROR,
+                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                         errmsg("pg_attach: fast defaults/missing values are not supported")));
+
         HeapTupleHeaderSetXmin(header, FrozenTransactionId);
         HeapTupleHeaderSetXmax(header, InvalidTransactionId);
 
-        /* Only tuples flagged HASEXTERNAL can carry on-disk TOAST pointers:
-         * skip deformation entirely for the rest. */
-        if (!patch_toast || !(header->t_infomask & HEAP_HASEXTERNAL))
+        if (target_lz4_supported &&
+            (!patch_toast || !(header->t_infomask & HEAP_HASEXTERNAL)))
             continue;
 
         if (values == NULL)
@@ -198,16 +296,28 @@ pg_attach_prepare_heap_page(Page page, Relation rel, BlockNumber blkno,
                 continue;
 
             value = (struct varlena *) DatumGetPointer(values[attno]);
+            if (!target_lz4_supported && VARATT_IS_4B_C(value) &&
+                VARDATA_COMPRESSED_GET_COMPRESS_METHOD(value) == TOAST_LZ4_COMPRESSION_ID)
+                ereport(ERROR,
+                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                         errmsg("pg_attach: target does not support lz4-compressed inline values")));
+
             if (VARATT_IS_EXTERNAL_ONDISK(value))
             {
                 varatt_external external;
 
+                VARATT_EXTERNAL_GET_POINTER(external, value);
+                if (!target_lz4_supported && VARATT_EXTERNAL_IS_COMPRESSED(external) &&
+                    VARATT_EXTERNAL_GET_COMPRESS_METHOD(external) == TOAST_LZ4_COMPRESSION_ID)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                             errmsg("pg_attach: target does not support lz4-compressed TOAST values")));
+                if (!patch_toast)
+                    continue;
                 if (target_toast_oid == InvalidOid)
                     ereport(ERROR,
                             (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
                              errmsg("pg_attach: target table has no TOAST relation")));
-
-                VARATT_EXTERNAL_GET_POINTER(external, value);
                 if (external.va_toastrelid != source_toast_oid)
                     ereport(ERROR,
                             (errcode(ERRCODE_DATA_CORRUPTED),
@@ -275,10 +385,13 @@ pg_attach_attributes(Relation rel, PgAttachAttribute *attrs)
 
         memset(dst, 0, sizeof(*dst));
         strlcpy(dst->name, NameStr(src->attname), NAMEDATALEN);
-        dst->type_oid = src->atttypid;
-        dst->collation_oid = src->attcollation;
         dst->typmod = src->atttypmod;
         dst->len = src->attlen;
+        dst->align = (uint8) src->attalign;
+        dst->by_val = src->attbyval;
+        dst->storage = (uint8) src->attstorage;
+        dst->has_missing = src->atthasmissing;
+        dst->generated = (uint8) src->attgenerated;
         dst->not_null = src->attnotnull;
         dst->dropped = src->attisdropped;
     }

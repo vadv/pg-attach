@@ -1,18 +1,20 @@
 # pg_attach
 
-PoC PostgreSQL extension that freezes and transfers a table between two PostgreSQL 16–18 instances as heap, TOAST and existing btree pages. It avoids decoding/rebuilding rows and indexes. Both sides must use the same major version. PostgreSQL 19 is out of scope until its stable release.
+PoC PostgreSQL extension that freezes and transfers a table between two PostgreSQL 16–18 instances as heap, TOAST and existing btree pages. It avoids decoding/rebuilding rows and indexes. Same-major transfers and upward upgrades 16→17, 16→18 and 17→18 are supported for the validated physical subset below. Downgrades and PostgreSQL 19 are out of scope.
 
 ## Scope
 
-- Same PostgreSQL major, architecture, `BLCKSZ`, encoding and `data_checksums` on both sides.
-- Plain logged heap tables and ordinary, non-partial, non-exclusion btree indexes.
-- An existing target is fully overwritten and must have identical attributes and btree keys; it may be non-empty and its name may differ.
-- If the target is absent, the extension creates its table/columns, supported constraints and btree indexes from a compact binary schema descriptor. The target name may differ from the source name. Automatic creation currently rejects identity columns and foreign/exclusion constraints; create such a target explicitly first.
+- Matching architecture, `BLCKSZ`, alignment, endianness, encoding, TOAST geometry, checksum algorithm and `data_checksums` mode on both sides.
+- Plain logged heap tables and ordinary valid non-partial, non-expression, non-exclusion btree indexes with `pg_catalog` opclasses only.
+- An existing target is fully overwritten and must have identical physical attributes, collations and structural btree metadata; it may be non-empty and its name may differ.
+- If the target is absent, the extension creates its table/columns, supported constraints and btree indexes from a compact binary schema descriptor. The target name may differ from the source name. Automatic creation rejects identity columns. Foreign and exclusion constraints are unsupported in every mode; exclusion indexes are also rejected.
+- Only whitelisted built-in types without catalog OIDs in their values, and arrays of those types. Enum, `reg*`, OID/oidvector, aclitem, composite/range/domain and extension-defined types are rejected.
+- Fast defaults/missing values and virtual generated columns are rejected. Complete collation ordering identity must match: resolved name, provider, locale, deterministic flag, encoding, and stored/actual versions. Database-default identities without a concrete matching catalog row are rejected. Actual lz4 values are rejected if the target lacks lz4 support.
 - ACLs, ownership, grants, roles and other privileges are deliberately out of scope and are not transferred.
 - Import runs `VACUUM (FREEZE)` on the source and validates frozen heap/TOAST tuples under lock. Visibility map and free space map forks are transferred with each relation, so index-only scans and free-space reuse start warm; run `VACUUM (ANALYZE)` on the target for planner statistics.
-- No partitions, foreign tables, unlogged tables, non-btree indexes, or cross-version upgrades.
+- No partitions, foreign tables, unlogged tables, non-btree indexes, downgrades, differing checksum modes, or on-the-fly tuple conversion.
 
-Both instances need the same extension version installed. No background worker or `shared_preload_libraries` entry is needed. The source only serves a `COPY` stream; the target pulls it through libpq. Immediately after connecting, the target calls `pg_attach_server_info()` and verifies the extension version, PostgreSQL major, `BLCKSZ`, alignment, endianness, encoding and checksum mode. A missing function, malformed response or mismatch closes the connection before `VACUUM`, locks or `CHECKPOINT`.
+Both instances need pg_attach 0.3.0 installed. No background worker or `shared_preload_libraries` entry is needed. The source only serves a `COPY` stream; the target pulls it through libpq. Immediately after connecting, the target calls `pg_attach_server_info()` and verifies the extension version, allowed major pair, `BLCKSZ`, alignment, endianness, encoding, checksum mode/algorithm, TOAST chunk size and identifier length. A missing function, malformed response or mismatch closes the connection before `VACUUM`, locks or `CHECKPOINT`.
 
 The extension version is the only pg_attach wire/schema compatibility version; there is no independent protocol-version negotiation. Any compatibility-affecting wire, schema or SQL API change requires an extension-version change before release.
 
@@ -33,10 +35,15 @@ The Makefile exports the resolved `pg_config` path to pgrx and rejects a version
 The BDD suite requires Docker and starts two isolated postmasters inside one test container:
 
 ```sh
+make bdd PG_VERSION=16
 make bdd PG_VERSION=17
+make bdd PG_VERSION=18
+SOURCE_PG_VERSION=16 TARGET_PG_VERSION=17 ./tests/bdd/run.sh
+SOURCE_PG_VERSION=16 TARGET_PG_VERSION=18 ./tests/bdd/run.sh
+SOURCE_PG_VERSION=17 TARGET_PG_VERSION=18 ./tests/bdd/run.sh
 ```
 
-The Gherkin scenarios cover heap pages, external TOAST, NULL, btree lookup, empty tables, dropped-column layout, full overwrite, auto-created destination constraints/defaults, repeated import with multiple indexes, incompatible layouts, invalid/missing/offline sources, non-default tablespaces and non-superuser source owners. Docker builds also run Rust unit tests and strict Clippy lints.
+The Gherkin scenarios cover heap pages, external TOAST, NULL, btree lookup/index-only scans, empty and dropped-column layouts, overwrite and automatic target creation, validation/rollback, and explicit unsafe-type/default/generated/collation/compression/checksum failures. Every successful cross-major pair is checked with `verify_heapam` and `bt_index_check(..., heapallindexed=true)` across checksum and WAL modes. Docker builds also run Rust unit tests and strict Clippy lints.
 
 For native debugging tools and backtrace commands, see [DEBUG.md](DEBUG.md).
 
@@ -68,7 +75,7 @@ The source export function is internal to the transfer; use `pg_attach_import` r
 
 Legacy raw frozen xmin from pre-9.4 `pg_upgrade` is intentionally unsupported: streaming rejects it even if VM is marked all-frozen, and the target transaction rolls back.
 
-The target takes `AccessExclusiveLock` and imports in one transaction. Existing target storage is replaced with new relfilenumbers; a missing target is created in the same transaction, so failure rolls back both creation and import. This is full overwrite, not a merge. Existing targets still require identical attributes and btree definitions; unexpected extra indexes are rejected rather than silently dropped.
+The target takes `AccessExclusiveLock` and imports in one transaction. Existing target storage is replaced with new relfilenumbers only after attribute, collation, TOAST and structural btree validation; a missing target is created in the same transaction, so failure rolls back both creation and import. This is full overwrite, not a merge. Unexpected extra indexes are rejected rather than silently dropped.
 
 For a missing target, `pg_attach_export_schema` returns a compact binary descriptor over the same COPY transport. It contains type/default/constraint/index metadata, not a `pg_dump` invocation or PL/pgSQL. Target-side Rust quotes the requested destination name independently of the source name.
 
@@ -80,6 +87,6 @@ Use `generate_wal = true` for a normal permanent table, physical replicas, PITR,
 
 ## Implementation notes
 
-`src/page_shim.c` contains PostgreSQL C macro access, relation-buffer flushing, frozen-tuple validation, direct SMGR reads, TOAST pointer rewriting, page checksum/LSN handling, SMGR writes and WAL/fsync calls. `src/pg_attach/wire.rs` is a bounded big-endian packet/schema codec with unit tests. `src/pg_attach/exporter.rs` emits schema metadata and one COPY bytea value per packet; `src/pg_attach/importer.rs` optionally creates the target, validates the manifest and installs pages sequentially. No staging files are created.
+`src/page_shim.c` contains PostgreSQL C macro access, relation-buffer flushing, frozen-tuple validation, direct SMGR reads with source checksum/layout verification, TOAST pointer and compression checks, btree metapage validation, page checksum/LSN handling, SMGR writes and WAL/fsync calls. `src/pg_attach/wire.rs` is a bounded big-endian packet/schema codec with unit tests. `src/pg_attach/exporter.rs` emits schema and structural physical metadata plus one COPY bytea value per packet; `src/pg_attach/importer.rs` optionally creates the target, validates the manifest and installs pages sequentially. No staging files or tuple conversion are used.
 
-See `docs/roadmap.md` for the PG16–PG18 matrix, future index/case DoD and C-boundary plan. The implemented Rust/Cucumber BDD suite lives in `tests/bdd`; its scenarios use plain SQL docstrings and two postmasters in one test container. See `docs/bdd-epic.md` for the original planning epic.
+See `docs/cross-version-roadmap.md` for the implemented upgrade matrix and remaining limits, and `docs/roadmap.md` for future index/case work. The Rust/Cucumber BDD suite lives in `tests/bdd`; its scenarios use plain SQL docstrings and two postmasters with independent major binaries in one test container.

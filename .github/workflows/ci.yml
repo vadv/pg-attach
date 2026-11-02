@@ -32,3 +32,35 @@ jobs:
           name: bdd-logs-pg${{ matrix.pg }}
           path: target/bdd-logs/
           if-no-files-found: ignore
+
+  cross-major-matrix:
+    name: PostgreSQL ${{ matrix.source }} to ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - source: 16
+            target: 17
+          - source: 16
+            target: 18
+          - source: 17
+            target: 18
+    env:
+      SOURCE_PG_VERSION: ${{ matrix.source }}
+      TARGET_PG_VERSION: ${{ matrix.target }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Build, lint and run cross-major BDD scenarios
+        run: ./tests/bdd/run.sh
+
+      - name: Upload cross-major BDD logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bdd-logs-pg${{ matrix.source }}-pg${{ matrix.target }}
+          path: target/bdd-logs/
+          if-no-files-found: ignore

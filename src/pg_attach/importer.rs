@@ -13,28 +13,6 @@ struct ImportState {
     done: bool,
 }
 
-fn attributes(rel: &Rel) -> Vec<wire::Attribute> {
-    rel.attributes()
-        .into_iter()
-        .map(|attribute| {
-            let end = attribute
-                .name
-                .iter()
-                .position(|byte| *byte == 0)
-                .unwrap_or(attribute.name.len());
-            wire::Attribute {
-                name: String::from_utf8_lossy(&attribute.name[..end]).into_owned(),
-                type_oid: attribute.type_oid.to_u32(),
-                collation_oid: attribute.collation_oid.to_u32(),
-                typmod: attribute.typmod,
-                len: attribute.len,
-                not_null: attribute.not_null,
-                dropped: attribute.dropped,
-            }
-        })
-        .collect()
-}
-
 fn quote_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
@@ -102,6 +80,21 @@ fn create_target(schema: &TableSchema, target_table: &str) -> Result<(), String>
     ))
     .map_err(|error| error.to_string())?;
 
+    for column in &schema.columns {
+        let storage = match column.storage {
+            b'p' => "PLAIN",
+            b'e' => "EXTERNAL",
+            b'm' => "MAIN",
+            b'x' => "EXTENDED",
+            other => return Err(format!("unsupported attribute storage code {other}")),
+        };
+        Spi::run(&format!(
+            "ALTER TABLE {target_name} ALTER COLUMN {} SET STORAGE {storage}",
+            quote_ident(&column.name)
+        ))
+        .map_err(|error| error.to_string())?;
+    }
+
     // Recreate dropped attribute numbers as well: heap pages retain their physical layout.
     for column in schema.columns.iter().filter(|column| column.dropped) {
         Spi::run(&format!(
@@ -119,17 +112,6 @@ fn create_target(schema: &TableSchema, target_table: &str) -> Result<(), String>
         .map_err(|error| error.to_string())?;
     }
     Ok(())
-}
-
-fn index_shape(definition: &str) -> &str {
-    definition
-        .find(" USING ")
-        .map_or(definition, |position| &definition[position..])
-}
-
-fn same_index_definition(left: &str, right: &str) -> bool {
-    left.starts_with("CREATE UNIQUE INDEX") == right.starts_with("CREATE UNIQUE INDEX")
-        && index_shape(left) == index_shape(right)
 }
 
 #[allow(clippy::cast_possible_wrap)] // PostgreSQL constants are ASCII on either c_char signedness.
@@ -153,10 +135,14 @@ fn prepare_state(
     if manifest.target_table != target_table {
         return Err("source manifest names a different target table".into());
     }
-    if manifest.checksums != ffi::data_checksums_enabled() {
+    if manifest.source_checksums != manifest.target_checksums {
+        return Err("transfers between different checksum modes are not supported".into());
+    }
+    if manifest.target_checksums != ffi::data_checksums_enabled() {
         return Err("manifest checksum setting differs from target".into());
     }
-    let target_attributes = attributes(&target_main);
+    wire::validate_attributes(&manifest.attributes)?;
+    let target_attributes = target_main.attributes()?;
     if manifest.attributes != target_attributes {
         return Err(format!(
             "source and target table attributes differ: source={:?}, target={:?}",
@@ -173,10 +159,18 @@ fn prepare_state(
     {
         return Err("source and target TOAST layout differs".into());
     }
-
-    let source_index_columns = &manifest.index_definitions;
-    if source_index_columns.len() != target_indexes.len() {
+    let user_index_start = usize::from(source_has_toast);
+    if manifest.indexes.len() != target_indexes.len() + user_index_start {
         return Err("source and target index counts differ".into());
+    }
+
+    if source_has_toast {
+        let target = target_toast_index
+            .as_ref()
+            .ok_or_else(|| "missing target TOAST index".to_owned())?;
+        if ffi::index_metadata(target.oid())? != manifest.indexes[0] {
+            return Err("source and target TOAST btree metadata differ".into());
+        }
     }
 
     let mut targets = Vec::with_capacity(manifest.relations.len());
@@ -185,11 +179,16 @@ fn prepare_state(
         targets.push(target_toast.ok_or_else(|| "missing target TOAST relation".to_owned())?);
         targets.push(target_toast_index.ok_or_else(|| "missing target TOAST index".to_owned())?);
     }
-    for definition in source_index_columns {
-        let position = target_indexes
-            .iter()
-            .position(|(candidate, _)| same_index_definition(candidate, definition))
-            .ok_or_else(|| format!("target lacks source btree index ({definition})"))?;
+    for source_index in &manifest.indexes[user_index_start..] {
+        let mut position = None;
+        for (candidate, (_, index)) in target_indexes.iter().enumerate() {
+            if &ffi::index_metadata(index.oid())? == source_index {
+                position = Some(candidate);
+                break;
+            }
+        }
+        let position = position
+            .ok_or_else(|| format!("target lacks source btree index ({source_index:?})"))?;
         let (_, index) = target_indexes.remove(position);
         targets.push(index);
     }
@@ -197,8 +196,6 @@ fn prepare_state(
     for target in &targets {
         reset_storage(target);
     }
-    // Main-fork entries map onto the unique targets in order; every fork entry
-    // rides on the relation of the main entry that precedes it in the manifest.
     let mut routes = Vec::with_capacity(manifest.relations.len());
     let mut main_count = 0usize;
     let mut owner: Option<usize> = None;
@@ -277,12 +274,36 @@ impl ImportState {
         // Only main-fork pages carry data checksums; VM and FSM pages transfer
         // byte-exact without verification.
         if fork == MAIN_FORK
-            && !Rel::verify_page(packet.block, &mut packet.bytes, self.manifest.checksums)
+            && !Rel::verify_page(
+                packet.block,
+                &mut packet.bytes,
+                self.manifest.target_checksums,
+            )
         {
             return Err(format!(
                 "page verification failed for block {} of relation {}",
                 packet.block, relation_index
             ));
+        }
+        if fork == MAIN_FORK && metadata.kind == RelationKind::Index && packet.block == 0 {
+            let ordinal = self.manifest.relations[..=relation_index]
+                .iter()
+                .filter(|relation| {
+                    relation.kind == RelationKind::Index && relation.fork == metadata.fork
+                })
+                .count()
+                .checked_sub(1)
+                .ok_or_else(|| "btree metadata ordinal underflow".to_owned())?;
+            let expected = self
+                .manifest
+                .indexes
+                .get(ordinal)
+                .ok_or_else(|| "missing btree metadata in manifest".to_owned())?;
+            if !Rel::verify_btree_metapage(&mut packet.bytes, expected.all_equal_image) {
+                return Err(format!(
+                    "btree metapage verification failed for relation {relation_index}"
+                ));
+            }
         }
         self.targets[target_index].write_page(fork, packet.block, &packet.bytes);
         self.next_blocks[relation_index] += 1;
@@ -398,11 +419,14 @@ pub unsafe fn import(
     let mut target_indexes = targets.indexes;
 
     let target_checksums = ffi::data_checksums_enabled();
-    let command = format!(
-        "COPY (SELECT pg_attach_export_stream({}, {}, {}::oid, {})) TO STDOUT (FORMAT binary)",
+    let target_lz4_supported = ffi::lz4_supported() && !crate::DEBUG_DISABLE_LZ4.get();
+    let command =
+        format!(
+        "COPY (SELECT pg_attach_export_stream({}, {}, {}::oid, {}, {})) TO STDOUT (FORMAT binary)",
         quote_literal(source_table),
         quote_literal(target_table),
         target_toast_oid.to_u32(),
+        if target_lz4_supported { "true" } else { "false" },
         if target_checksums { "true" } else { "false" },
     );
     let mut state: Option<ImportState> = None;

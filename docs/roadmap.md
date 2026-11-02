@@ -5,27 +5,29 @@
 
 ## Матрица совместимости
 
-Цель проекта — одинаковая major-версия на source и target из диапазона
-PostgreSQL 16, 17, 18 и 19. Это не cross-version physical upgrade: page layout,
-`BLCKSZ`, encoding, checksum mode и остальные physical prerequisites должны
-совпадать.
+Поддерживаются same-major PostgreSQL 16–18 и upward physical transfer 16→17,
+16→18, 17→18 для whitelist-типов и simple btree. Page layout, `BLCKSZ`, encoding,
+checksum mode и остальные physical prerequisites должны совпадать; downgrade и
+конвертация tuples запрещены. Точные типы и ограничения описаны в
+`docs/cross-version-roadmap.md`.
 
 - `pg16`, `pg17`, `pg18` — отдельные Cargo features pgrx 0.19.3;
 - каждая сборка выбирает ровно одну feature и соответствующий `pg_config`;
-- локальный Docker BDD и strict build пройдены на PostgreSQL 16, 17 и 18;
-- GitHub Actions запускает build/lint/BDD для каждой поддерживаемой major;
-- PostgreSQL 19 не входит в matrix до stable release;
+- GitHub Actions запускает build/lint/BDD для каждой major и каждой upward pair;
+- PostgreSQL 19 не входит в matrix до stable release и отдельного анализа;
 - зелёная компиляция не считается доказательством физической совместимости.
 
 ## Индексы и physical cases
 
-Сейчас поддерживаются только обычные валидные non-partial, non-exclusion btree.
-Следующие элементы требуют исследования и отдельных реализаций, а не просто
-удаления проверки `BTREE_AM_OID`:
+Сейчас поддерживаются обычные валидные non-partial, non-expression,
+non-exclusion btree с совпадающими structural metadata и metapage. Следующие
+элементы требуют исследования и отдельных реализаций, а не просто удаления
+проверки `BTREE_AM_OID`:
 
-1. **Btree variants**: включить included columns, expression indexes, custom
-   opclasses/collation, `NULLS NOT DISTINCT`, deduplication и multi-page/metapage
-   cases. Проверять, что manifest описывает index definition достаточно точно.
+1. **Btree variants**: expression indexes и другие AM-specific cases. Для новых
+   included/opclass/collation/`NULLS NOT DISTINCT`/dedup scenarios сначала
+   добавляются explicit BDD и проверки manifest/metapage; уже реализованные
+   structural checks не считаются доказательством для отсутствующих сценариев.
 2. **GiST**: исследовать `gistinitpage`, opaque page metadata, `F_FOLLOW_RIGHT`,
    NSN/LSN semantics и recovery. До отдельной реализации не переносить как raw
    pages; logical fallback не считать эквивалентом.
@@ -37,8 +39,8 @@ PostgreSQL 16, 17, 18 и 19. Это не cross-version physical upgrade: page la
 5. **Hash**: исследовать bucket pages, bitmap, metapage, split state и WAL.
 6. **SP-GiST**: исследовать inner/leaf tuple formats и специальные страницы.
 7. **Неструктурные случаи**: partitioned tables, partitioned indexes, foreign
-   tables, unlogged relations, TOAST с нестандартными типами, generated/dropped
-   columns, composite types, collations и checksums.
+   tables, unlogged relations, нестандартные TOAST-типы, fast defaults, virtual
+   generated columns, composite/OID-bearing types и переход между checksum modes.
 
 Для каждого AM сначала записываются page invariants и rollback/recovery story,
 затем реализуется один узкий happy path и только после этого расширяется matrix.
@@ -188,7 +190,8 @@ SMGR page I/O и WAL/fsync. Дальнейшие сокращения:
 
 ## Не входит автоматически
 
-Cross-major upgrade (план и риски — в `docs/cross-version-roadmap.md`), online без freeze, merge в непустую таблицу, автоматическое
-создание произвольных index AM и production failover — отдельные проекты, а не
-побочный эффект добавления одного index type. ACL, ownership, grants, roles и
-privileges пока сознательно не переносятся (out of scope).
+Новые major-пары и типы вне реализованной cross-major матрицы, online без freeze,
+merge в непустую таблицу, автоматическое создание произвольных index AM и
+production failover — отдельные проекты, а не побочный эффект добавления одного
+index type. ACL, ownership, grants, roles и privileges пока сознательно не
+переносятся (out of scope).

@@ -1,195 +1,137 @@
 # Перенос таблиц между major-версиями PostgreSQL
 
-Статус: research/backlog. Сейчас перенос между major не поддерживается. Этот
-документ фиксирует, что нужно расширить в протоколе, и перечисляет функционал,
-который при переносе может тихо испортить данные.
+Статус: реализовано в pg_attach 0.3.0 для ограниченного physical-format
+подмножества. Перенос остаётся копированием страниц, а не логическим upgrade.
 
-## Граница задачи
+## Поддерживаемая матрица
 
-- Только **вверх**: 16→17, 16→18, 17→18 (`source major ≤ target major`, обе из
-  поддерживаемой матрицы). PostgreSQL 19 — после stable release.
-- **Без конвертации формата.** Если формат страницы, тупла или типа отличается,
-  перенос отклоняется до изменения target storage. Конвертировать не будем.
-- Downgrade (18→16 и т.п.) не поддерживается и отклоняется.
+- Одинаковые major 16→16, 17→17, 18→18, включая разные minor.
+- Только upgrade вверх: 16→17, 16→18 и 17→18.
+- Downgrade, другие направления и major вне 16–18 отклоняются.
+- PostgreSQL 19 не добавляется до отдельного анализа stable release.
 
-## Почему это вообще возможно
+`extension_version` — единственная версия совместимости pg_attach и его
+wire/schema/SQL API. Независимых protocol, manifest или schema-descriptor версий
+нет. Обе стороны должны иметь pg_attach 0.3.0, собранный под свою major.
 
-pg_upgrade **не деформирует туплы**: он копирует/линкует файлы как есть и
-опирается на стабильность on-disk формата. Если формат типа изменился, он
-отказывает (`check_for_data_types_usage` в `src/bin/pg_upgrade/check.c`).
-Последняя такая проверка — `aclitem`, `threshold_version = 1500`; для старого
-кластера 16/17 pg_upgrade 18 не содержит ни одной проверки формата типов.
+## Ранняя проверка сервера
 
-Совпадает в 16, 17, 18:
+Сразу после подключения target вызывает `pg_attach_server_info()` на source. До
+`VACUUM (FREEZE)`, locks, `CHECKPOINT`, чтения схемы и изменений target
+проверяются:
 
-- page layout version 4 (`PG_PAGE_LAYOUT_VERSION`, с 8.3);
-- `HeapTupleHeader`, `t_infomask`/`t_infomask2`, frozen-представление (с 9.4);
-- TOAST pointer `varatt_external` и метод сжатия в `va_extinfo` (с PG14);
-- btree `BTREE_VERSION = 4` (с PG13), читаются версии 2–4.
+- разрешённая major-пара и равная `extension_version`;
+- `BLCKSZ`, `MAXALIGN`, endianness и server encoding;
+- одинаковый checksum mode и `PG_DATA_CHECKSUM_VERSION`;
+- `TOAST_MAX_CHUNK_SIZE` и `NAMEDATALEN`;
+- корректность ответа о поддержке lz4 сборками.
 
-Две вещи, которые pg_upgrade решает сам, pg_attach обходит иначе:
+Несовпадение checksum modes не разрешается. В manifest отдельно записаны
+`source_checksums` и `target_checksums`; при текущей границе они обязаны
+совпадать. Отсутствие функции, NULL, malformed response или лишние/недостающие
+поля закрывают соединение без fallback.
 
-| Проблема | pg_upgrade | pg_attach |
-| --- | --- | --- |
-| XID, `pg_xact`, multixact | переносит clog, выставляет next XID | требует frozen tuples и invalid `xmax`: страница не ссылается на XID источника |
-| OID внутри данных | сохраняет OID (`--binary-upgrade`) | переписывает `va_toastrelid`; остальные встроенные OID — только отказ (см. ниже) |
+Поддержка lz4 не сравнивается как обязательное равенство сборок: таблица без
+lz4-значений может переноситься между разными сборками. Фактические inline и
+external lz4-значения отклоняются, если target не умеет их декодировать.
 
-## Текущее состояние: same-major handshake реализован
+## Почему ограниченный перенос возможен
 
-Сразу после подключения target вызывает SQL-функцию `pg_attach_server_info()` на
-source. Проверка выполняется **до** `VACUUM (FREEZE)`, locks, `CHECKPOINT`, чтения
-схемы и изменений target. Отсутствие функции, malformed response или несовпадение
-параметров закрывает соединение без fallback.
+В PG16–PG18 совпадают page layout version 4, `HeapTupleHeader` и frozen
+представление, формат TOAST pointer, метод сжатия в `va_extinfo` и btree version
+4. Как и pg_upgrade, pg_attach не конвертирует tuples: изменение их длины
+сделало бы TID и все btree недействительными.
 
-Правила на target:
+Протокол сначала выполняет обычный `VACUUM FREEZE → ACCESS EXCLUSIVE →
+validate/retry → CHECKPOINT`, затем читает страницы через SMGR. VM и FSM
+переносятся вместе с соответствующими relation forks. XID и TOAST relation OID
+не переносятся как ссылки на старый кластер: tuples уже frozen, а
+`va_toastrelid` переписывается на target TOAST OID без изменения размера tuple.
 
-| Условие | Решение |
-| --- | --- |
-| source major = target major | разрешено, включая разные minor |
-| source major ≠ target major | отказ |
-| `extension_version` различается | отказ |
-| `BLCKSZ`, `MAXALIGN`, endianness, encoding, checksum mode различаются | отказ |
+## Manifest и fail-closed validation
 
-`extension_version` — единственная версия совместимости pg_attach, включая его
-wire/schema-форматы. Независимых версий протокола, manifest и schema descriptor
-нет. Manifest не дублирует server version и ABI-параметры, потому что они уже
-проверены handshake. Любое изменение wire/schema/SQL API, влияющее на
-совместимость, требует изменения версии расширения перед публикацией.
+В manifest входят не OID типов и коллаций, а их стабильные имена, версии и
+physical attributes. Source и target должны совпасть по:
 
-## Дальнейшее расширение протокола
+- имени и порядку атрибутов, typmod, length, alignment, by-value и storage;
+- `attgenerated`, `atthasmissing`, NOT NULL и dropped-разметке;
+- stable type identity и полной collation ordering identity: resolved
+  schema/name, provider, locale, deterministic flag, encoding, `collversion` и
+  actual version, включая database-default и index collation resolution;
+- структурным btree key/include/opclass/collation/indoption/unique/
+  nulls-not-distinct полям, а не тексту `pg_get_indexdef`; разрешены только
+  opclasses из `pg_catalog`, поскольку имена не доказывают семантику сравнения;
+- btree metapage version, `btm_allequalimage` и результату
+  `_bt_allequalimage()` на target.
 
-### 1. Дополнительные handshake-параметры
+Для database-default collation требуется concrete `pg_collation` row с совпадающими
+provider, resolved locale и encoding. Если такой строки нет, identity и версии не
+считаются доказанными: перенос отклоняется как для атрибутов, так и для indexes.
 
-Для будущего cross-major handshake нужно добавить:
+TOAST index проверяется так же, как пользовательские btree. Expression, partial,
+exclusion, invalid и не-btree indexes отклоняются. Для автоматически созданного
+target schema descriptor по-прежнему содержит DDL metadata, но physical
+совпадение доказывается структурным manifest.
 
-- `max_toast_chunk_size`, `max_identifier_length`, версию checksum-алгоритма
-  (в PG18 есть ещё `default_char_signedness` — нужен только для будущих GIN);
-- методы TOAST-сжатия, поддерживаемые сборкой (`pglz`, `lz4`).
+Перед перезаписью LSN/TOAST pointer/checksum source проверяет checksum каждой
+main-fork страницы, если checksums включены, page size/layout и границы header.
+Heap tuple attribute count не может превышать descriptor; missing values на
+коротком tuple отклоняются. Target повторно проверяет page/checksum и btree
+metapage до записи. Все проверки catalog/manifest выполняются до смены target
+relfilenumbers; ошибки stream откатывают создание или overwrite целиком.
 
-Это дополнительные physical prerequisites, а не независимые версии протокола.
+## Поддерживаемые типы и оставшиеся ограничения
 
-### 2. Изменения manifest
+Разрешён whitelist встроенных scalar-типов без catalog OID в значении и массивов
+этих типов: boolean, integer и floating point, numeric, text/varchar/char/name,
+bytea, date/time/timestamp/interval, UUID, JSON/JSONB/JSONPath, XML, money,
+network, bit strings, geometric types, `pg_lsn`, `tsvector` и `tsquery`.
 
-Менять manifest нужно только вместе с версией расширения. Добавлять отдельное
-`VERSION`-поле или negotiation между форматами не требуется.
+Следующие случаи отклоняются, а не конвертируются:
 
-Предстоит добавить:
+- fast default / `atthasmissing` и любые missing values;
+- virtual generated columns (PG18); stored generated columns сохраняют вид;
+- enum и массивы enum, `oid`, `oidvector`, `reg*`, `aclitem`, composite,
+  system composite, range/multirange, domain и extension-defined types;
+- нестандартные physical layouts и типы вне whitelist;
+- различия stored/actual collation versions;
+- lz4-значения при target без lz4;
+- испорченная source-страница или отличающийся checksum mode;
+- non-btree, expression, partial и exclusion indexes.
 
-- **Источник:** отдельно `source_checksums` и `target_checksums`, если переход
-  checksum off → on будет разрешён (сейчас это одно поле `checksums`).
-- **Атрибуты** (`wire::Attribute`): `attgenerated`, `atthasmissing` и
-  текстовое `attmissingval`, `attalign`, `attbyval`, `attstorage`. Плюс
-  отпечаток типа вместо голого `type_oid` (см. «OID внутри данных»).
-- **Коллации:** имя, провайдер, `collversion` /
-  `pg_collation_actual_version()` для каждой коллации, участвующей в индексах.
-- **Индексы:** структурное описание вместо текста `pg_get_indexdef`:
-  `indkey`, opclass/opfamily по имени, `indcollation`, `indoption`,
-  `indisunique`, `indnullsnotdistinct`, наличие выражений/предиката. Текст
-  ruleutils отличается между версиями и даст ложные отказы.
-- **Btree metapage:** `btm_version`, `btm_allequalimage` каждого индекса.
+Автоматическое создание target не поддерживает identity columns. Foreign и
+exclusion constraints не поддерживаются ни в одном режиме; exclusion indexes
+также отклоняются. ACL, ownership, grants, roles и статистика не переносятся.
+После импорта следует выполнять `VACUUM (ANALYZE)` на target.
 
-### 3. SQL API
+## BDD и Definition of Done
 
-Для cross-major сигнатура `pg_attach_export_stream` может измениться (target
-передаёт свою major и checksum-режим). Нужен update script расширения. Обе
-стороны — один и тот же релиз pg_attach, собранный под свою major; handshake
-проверяет `extversion`.
+Same-major suite сохранён и дополнен отдельными negative features для fast
+defaults, OID-bearing types, collation drift, lz4 и source checksum. Каждый
+случай проверяет SQL-ошибку и видимое состояние target, а не скрытый комментарий.
 
-### 4. Инварианты страниц и туплов
+Mixed-major Docker image содержит обе сборки расширения и versioned PostgreSQL
+binaries. Запуск:
 
-На source перед модификацией страницы:
+```sh
+SOURCE_PG_VERSION=16 TARGET_PG_VERSION=17 ./tests/bdd/run.sh
+SOURCE_PG_VERSION=16 TARGET_PG_VERSION=18 ./tests/bdd/run.sh
+SOURCE_PG_VERSION=17 TARGET_PG_VERSION=18 ./tests/bdd/run.sh
+```
 
-- при включённых source checksums проверять сохранённую checksum **до**
-  переписывания LSN/TOAST pointer/checksum (сейчас её никто не проверяет, см.
-  «Отмывание порчи»);
-- `PageGetPageLayoutVersion == 4`, `PageGetPageSize == BLCKSZ`;
-- для heap: `HeapTupleHeaderGetNatts == natts` либо доказанная эквивалентность
-  missing values (см. `atthasmissing`).
+Для каждой пары проверяются checksum on/off и `generate_wal` on/off: heap,
+external TOAST, NULL, dropped columns, btree lookup, index-only scan и
+автоматическое создание target. После переноса выполняются
+`verify_heapam` и `bt_index_check(index, heapallindexed=true)`.
 
-На target после приёма:
+Negative matrix включает все downgrade-пары, разные checksum modes, enum и
+массивы enum, regclass/OID/oidvector/aclitem/system composite, fast defaults,
+PG18 virtual generated columns, collation mismatch, unsupported lz4 и
+испорченную source-страницу. Отдельно проверяется отказ до VACUUM для
+handshake-ошибок и сохранение прежних строк/отсутствие auto-created target для
+остальных ошибок.
 
-- те же проверки layout version и page size;
-- btree metapage: `btm_magic`, `btm_version` в диапазоне
-  `[BTREE_MIN_VERSION, BTREE_VERSION]` target;
-- `_bt_allequalimage()` на target совпадает с `btm_allequalimage` из source.
-
-## Что может сломать данные
-
-Колонка «Как проявится»: **тихо** — запрос вернёт неверные данные без ошибки;
-**ошибка** — данные после commit нечитаемы. Отказ до изменения target storage
-порчей не считается.
-
-### Уже присутствует в same-major (исправить до cross-version)
-
-Ни один из этих случаев не покрыт BDD; каждый нужно сначала подтвердить
-сценарием.
-
-| Случай | Механизм | Как проявится | Мера |
-| --- | --- | --- | --- |
-| `ALTER TABLE … ADD COLUMN … DEFAULT` (fast default, `atthasmissing`) | старые туплы короче tupdesc, значение берётся из `attmissingval` target. Созданный через `CREATE TABLE … DEFAULT` target не имеет missing value → NULL вместо default | тихо | проверять `t_natts` в `pg_attach_prepare_heap_page`; передавать и сравнивать `atthasmissing`/`attmissingval`; иначе отказ |
-| Virtual generated column (PG18) | на диске virtual-колонка хранится как NULL; `create_target` всегда пишет `STORED`; `Attribute` не сравнивает `attgenerated` | тихо (NULL в STORED-колонке) | сравнивать `attgenerated`, генерировать `VIRTUAL`/`STORED` по виду |
-| Отмывание порчи | source-страница читается `smgrread` без проверки checksum, затем exporter пересчитывает checksum. Испорченная страница приходит на target с валидной checksum | тихо | проверять checksum на source до модификации |
-| Совпавший OID пользовательского типа | сравнивается только `type_oid` колонки. У кластеров с одинаковой историей DDL OID совпадают (оба начинают с 16384), а OID меток `pg_enum` могут разойтись | тихо (enum показывает чужую метку) | отказ для enum и других типов с OID внутри значения |
-| Версия glibc/ICU | порядок btree по `text` задаётся библиотекой хоста, а не PG. При upgrade часто меняется и ОС | тихо (поиск/unique по индексу врёт) | сравнивать `collversion`; при различии — отказ или перестройка индекса |
-
-### Появляется или усиливается при cross-version
-
-| Функционал | Механизм | Как проявится | Мера |
-| --- | --- | --- | --- |
-| Снятие проверки одинаковых checksums (16 off → 18 on: `initdb` в PG18 включает их по умолчанию) | без source checksums порчу нельзя обнаружить, а target получит свежую валидную checksum | тихо | разрешать только с явной оговоркой; при source on — обязательная проверка до модификации |
-| Системные composite-типы (`pg_class` и др.) и типы `information_schema` в колонках | OID может совпадать (83 у `pg_class`), но набор колонок каталога меняется между версиями; OID типов `information_schema` выдаются при `initdb` | тихо (мусор в composite) | отказ, как в pg_upgrade (проверка «system-defined composite types in user tables» в `check.c`) |
-| OID внутри значения | enum (OID метки), `reg*`, `oid`, `oidvector`, `aclitem` (OID ролей), arrays (`elemtype`), composite (`datum_typeid`), range/multirange (`rangetypid`) | тихо | рекурсивный обход типа (domain → base, array → elem, composite → атрибуты, range → subtype). Разрешать только фиксированные OID из `.dat` (`< FirstGenbkiObjectId`) без каталожных ссылок в значении |
-| Маппинг типов/коллаций по имени вместо OID (понадобится для пользовательских типов) | формат extension-типов (PostGIS, hstore, vector) определяет версия расширения, а не PG; при major upgrade её обычно тоже обновляют | тихо | отказ по умолчанию; поддерживать только при совпадении версии расширения и явном whitelist |
-| Expression-индексы (сейчас не отклоняются: `is_btree` проверяет только предикат, и то через лениво загружаемый `rd_indpred`) | результат функции может отличаться между версиями (Unicode-таблицы, `normalize()`, багфиксы) → индекс не соответствует heap | тихо | отклонять expression-индексы при cross-version или перестраивать их на target |
-| Btree deduplication (`btm_allequalimage`) | флаг вычислен на source; если target считает opclass/коллацию не equalimage, дедупликация небезопасна | тихо | сверять `_bt_allequalimage()` на target |
-| TOAST/inline сжатие `lz4` | target собран без lz4 | ошибка при чтении | метод сжатия в handshake |
-| Описание схемы, сгенерированное `ruleutils` старого сервера | DDL выполняется на новом; в основном это ошибки `CREATE TABLE` (безопасный rollback), но семантика может разойтись: NOT NULL в `pg_constraint` (PG18), virtual по умолчанию для `GENERATED` (PG18) | ошибка или тихо | генерировать DDL на стороне target по структурным данным каталога (как `pg_dump`: новый клиент читает старый каталог) |
-| Downgrade | PostgreSQL не обещает, что старая версия прочитает данные новой | тихо или ошибка | отказ |
-| Конвертация туплов «на лету» | при изменении длины тупла меняются TID, все btree становятся невалидными; плюс в новом бинаре нужен код старого формата | тихо (неверные TID) | не делать; отказ, как у pg_upgrade |
-
-### Опциональный функционал с отдельным риском
-
-- **Перенос VM/FSM — реализован.** Форки читаются после freeze-валидации и
-  `CHECKPOINT` под тем же `ACCESS EXCLUSIVE`, так что биты VM соответствуют
-  переданным heap-страницам (`PD_ALL_VISIBLE` согласован). В WAL-режиме
-  страницы VM/FSM логируются тем же `log_relation` путём, что и heap.
-- **Перенос статистики.** `pg_statistic.stavalues*` — `anyarray` с OID типа и
-  version-specific форматом. Безопаснее `ANALYZE` на target, как сейчас.
-- **Другие index AM.** GIN с `pg_trgm` зависит от `default_char_signedness` (PG18
-  `pg_upgrade --set-char-signedness`); hash/GiST/SP-GiST/BRIN — см.
-  `docs/roadmap.md`.
-
-## Этапы
-
-0. **Исправить оставшиеся same-major риски:** `atthasmissing`, virtual generated,
-   проверка checksum на source, отказ для enum/OID-типов, сверка `collversion`.
-   Явный отказ при разных major уже реализован.
-1. **Дополнить handshake** недостающими physical prerequisites и расширить
-   manifest без введения независимой версии формата.
-2. **Инварианты страниц и туплов** на source и target.
-3. **Безопасность типов:** рекурсивный whitelist и отказ для системных
-   composite/`information_schema`.
-4. **Структурное описание индексов и схемы**, DDL на стороне target.
-5. **Включить 16→17, 17→18, 16→18.** Отдельно — переход checksums off → on.
-6. **Известные несовместимости по парам версий:** перед включением каждой пары
-   разобрать раздел «Migration to Version N» в release notes (пункты про
-   `REINDEX`, изменения типов и функций) и закрепить вывод проверкой или BDD.
-
-## Definition of Done
-
-- [x] Несовместимые major и текущие physical prerequisites отклоняются **до**
-      `VACUUM (FREEZE)`/lock/checkpoint с понятным сообщением.
-- [ ] Дополнительные prerequisites (TOAST chunk, `NAMEDATALEN`, сжатие)
-      проверяются до побочных эффектов.
-- [x] Downgrade и major вне матрицы отклоняются.
-- [ ] BDD-образ с двумя разными major-версиями; сценарии 16→17, 16→18, 17→18:
-      heap, external TOAST, NULL, dropped columns, btree lookup и
-      index-only scan, auto-create target.
-- [ ] Отрицательные сценарии: enum, `reg*`, системный composite, fast default,
-      virtual generated (PG18), различие `collversion`, lz4 без поддержки,
-      испорченная source-страница при включённых checksums.
-- [ ] После переноса `amcheck` (`bt_index_check` с `heapallindexed`) и
-      `verify_heapam` на target проходят без ошибок.
-- [ ] Checksums on/off и `generate_wal` on/off на каждой паре.
-- [ ] `cargo fmt --check`, строгий Clippy, unit tests и Docker BDD зелёные для
-      всех поддерживаемых major.
+Обязательная проверка ветки: `cargo fmt --check`, strict Clippy, unit tests,
+все same-major PG16–PG18 BDD и все три cross-major BDD pairs. Расширение
+whitelist или разрешение нового checksum/type/layout случая требует отдельных
+RED→GREEN regressions и не должно маскироваться под tuple conversion.
