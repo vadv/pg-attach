@@ -33,10 +33,10 @@ jobs:
 
       - name: Compute toolchain tag
         # Same inputs as tests/bdd/run.sh derives locally: Dockerfile +
-        # Cargo.lock. A change to either produces a new tag, so stale
-        # builder layers are never reused as cache.
+        # Cargo.lock + this workflow. A change to any produces a new tag, so
+        # stale builder layers are never reused as cache.
         id: tag
-        run: echo "tag=$(cat Dockerfile Cargo.lock | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+        run: echo "tag=$(cat Dockerfile Cargo.lock .github/workflows/images.yml | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
 
       - name: Log in to GHCR
         # ghcr.io auth intermittently times out under GHA load; retry the
@@ -67,7 +67,12 @@ jobs:
         if: steps.exists.outputs.exists != 'true'
         run: |
           image="$REGISTRY/${IMAGE_PREFIX}/builder-pg${{ matrix.pg }}:${{ steps.tag.outputs.tag }}"
+          # BUILDKIT_INLINE_CACHE embeds cache metadata so ci.yml's
+          # --cache-from can actually reuse these layers; without it the
+          # image exists but restores zero layers and every CI run
+          # reinstalls the toolchain from apt.
           docker build --target toolchain \
+            --build-arg BUILDKIT_INLINE_CACHE=1 \
             --build-arg PG_VERSION=${{ matrix.pg }} \
             -t "$image" .
           docker push "$image"
