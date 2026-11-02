@@ -25,7 +25,7 @@ pg_upgrade **не деформирует туплы**: он копирует/л�
 - page layout version 4 (`PG_PAGE_LAYOUT_VERSION`, с 8.3);
 - `HeapTupleHeader`, `t_infomask`/`t_infomask2`, frozen-представление (с 9.4);
 - TOAST pointer `varatt_external` и метод сжатия в `va_extinfo` (с PG14);
-- btree `BTREE_VERSION = 4` (с PG13), читаются версии 2–4.
+- btree `BTREE_VERSION = 4` (с PG12), читаются версии 2–4.
 
 Две вещи, которые pg_upgrade решает сам, pg_attach обходит иначе:
 

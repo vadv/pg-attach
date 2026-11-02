@@ -1,7 +1,11 @@
 # Epic: Rust Cucumber BDD для pg_attach
 
-Статус: реализовано 24 сценария — harness, core, destination, validation и
-resilience. Документ сохраняет исходный план эпика и не изменяет SQL API расширения.
+Статус: реализовано и мержено. Покрытие выросло с 24 до 77 сценариев: core,
+destination, validation, resilience, transfer, VM/FSM, freeze-retry и 10GB
+smoke. Отдельный mixed-major harness (cross-features) переносит таблицы между
+PostgreSQL 16→17, 16→18, 17→18 и проверяет отклонение downgrade и
+несовместимых layout'ов. Документ сохраняет исходный план эпика и не изменяет
+SQL API расширения.
 
 ## Цель
 

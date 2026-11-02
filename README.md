@@ -1,6 +1,6 @@
 # pg_attach
 
-PoC PostgreSQL extension that freezes and transfers a table between two PostgreSQL 16–18 instances as heap, TOAST and existing btree pages. It avoids decoding/rebuilding rows and indexes. Both sides must use the same major version. PostgreSQL 19 is out of scope until its stable release.
+PoC PostgreSQL extension that freezes and transfers a table between two PostgreSQL 16–18 instances as heap, TOAST and existing btree pages. It avoids decoding/rebuilding rows and indexes. Same-major transfer and upward upgrade paths 16→17, 16→18, 17→18 are supported; downgrade is rejected. PostgreSQL 19 is out of scope until its stable release.
 
 ## Scope
 

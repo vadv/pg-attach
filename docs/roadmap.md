@@ -1,14 +1,17 @@
 # Дальнейшее развитие pg_attach
 
 Статус: research/backlog. Здесь нет обещаний, что перечисленные index AM и
-сценарии уже поддерживаются.
+сценарии уже поддерживаются. Уже выполнено и смержено: direct disk read, local
+clone (`pg_attach_import_local`), перенос VM/FSM форков, автоматический freeze
+с bounded retry, mixed-major перенос 16→17, 16→18, 17→18 (PR #8); downgrade
+отклоняется.
 
 ## Матрица совместимости
 
-Цель проекта — одинаковая major-версия на source и target из диапазона
-PostgreSQL 16, 17, 18 и 19. Это не cross-version physical upgrade: page layout,
-`BLCKSZ`, encoding, checksum mode и остальные physical prerequisites должны
-совпадать.
+Цель проекта — одинаковая major-версия на source и target ИЛИ upgrade внутри
+диапазона PostgreSQL 16–18 (16→17, 16→18, 17→18; PR #8). Downgrade и
+перенос между несовместимыми physical layout отклоняются: `BLCKSZ`, encoding,
+checksum mode и остальные physical prerequisites должны совпадать.
 
 - `pg16`, `pg17`, `pg18` — отдельные Cargo features pgrx 0.19.3;
 - каждая сборка выбирает ровно одну feature и соответствующий `pg_config`;

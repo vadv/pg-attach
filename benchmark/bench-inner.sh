@@ -6,7 +6,9 @@ set -eu
 TABLE=$1 SIZE=$2 METHOD=$3
 
 case "$SIZE" in
-  s) ROWS=10000 ;; m) ROWS=100000 ;; l) ROWS=500000 ;;
+  s) ROWS=10000 ;;
+  m) ROWS=100000 ;;
+  l) if [ "$TABLE" = events ]; then ROWS=1000000; else ROWS=500000; fi ;;
   *) echo "bad size $SIZE" >&2; exit 1 ;;
 esac
 case "$TABLE" in events|metrics) ;; *) echo "bad table $TABLE" >&2; exit 1 ;; esac
@@ -86,7 +88,7 @@ snap_io() {
 }
 snap_cpu() { awk '/^usage_usec/{print $2}' /sys/fs/cgroup/cpu.stat; }
 snap_lsn() { L=$(psql_a -c "select pg_current_wal_lsn()::text"); M=0; if [ "$TWO_INSTANCE" = 1 ]; then M=$(psql_b -c "select pg_current_wal_lsn()::text"); fi; echo "$L $M"; }
-lsn_num() { echo $(( 0x$(echo "$1" | cut -d/ -f1) * 16777216 + 0x$(echo "$1" | cut -d/ -f2) )); }
+lsn_num() { echo $(( 0x$(echo "$1" | cut -d/ -f1) * 4294967296 + 0x$(echo "$1" | cut -d/ -f2) )); }
 
 IO1=$(snap_io); CPU1=$(snap_cpu); LSN1=$(snap_lsn)
 T0=$(date +%s.%N)
