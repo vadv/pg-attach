@@ -43,6 +43,7 @@ typedef struct PgAttachBtreeMetadata
 } PgAttachBtreeMetadata;
 
 bool pg_attach_verify_page(Page page, BlockNumber blkno, bool checksums);
+bool pg_attach_heap_page_is_frozen(Page page);
 
 Oid
 pg_attach_resolve_relation(const char *name)
@@ -94,6 +95,16 @@ pg_attach_heap_page_is_frozen(Page page)
             return false;
     }
     return true;
+}
+
+void
+pg_attach_assert_heap_page_frozen(Relation rel, Page page, BlockNumber blkno)
+{
+    if (!pg_attach_heap_page_is_frozen(page))
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("pg_attach: direct source block %u of relation %u is not frozen",
+                        blkno, RelationGetRelid(rel))));
 }
 
 static void
@@ -193,6 +204,32 @@ pg_attach_btree_metadata(Relation rel, PgAttachBtreeMetadata *metadata)
     metadata->all_equal_image = metapage->btm_allequalimage;
     metadata->expected_all_equal_image = _bt_allequalimage(rel, false);
     UnlockReleaseBuffer(buffer);
+}
+
+/* A same-server before/after fingerprint, not a cross-major wire format. */
+const char *
+pg_attach_btree_metapage_signature(Relation rel)
+{
+    Buffer buffer;
+    Page page;
+    BTMetaPageData *metapage;
+    const char *signature;
+
+    buffer = ReadBuffer(rel, BTREE_METAPAGE);
+    LockBuffer(buffer, BUFFER_LOCK_SHARE);
+    page = BufferGetPage(buffer);
+    if (PageIsNew(page))
+        elog(ERROR, "pg_attach: btree metapage is uninitialized");
+    metapage = BTPageGetMeta(page);
+    signature = psprintf("%u|%d|%u|%d|%u|%d|%u|%.17g|%d",
+                         metapage->btm_magic, metapage->btm_version,
+                         metapage->btm_root, metapage->btm_level,
+                         metapage->btm_fastroot, metapage->btm_fastlevel,
+                         metapage->btm_last_cleanup_num_delpages,
+                         metapage->btm_last_cleanup_num_heap_tuples,
+                         (int) metapage->btm_allequalimage);
+    UnlockReleaseBuffer(buffer);
+    return signature;
 }
 
 int

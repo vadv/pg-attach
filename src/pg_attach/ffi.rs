@@ -90,6 +90,11 @@ unsafe extern "C" {
         checksums: bool,
     ) -> bool;
     fn pg_attach_heap_page_is_frozen(page: *const c_char) -> bool;
+    fn pg_attach_assert_heap_page_frozen(
+        rel: pg_sys::Relation,
+        page: *const c_char,
+        block: pg_sys::BlockNumber,
+    );
     fn pg_attach_prepare_heap_page(
         page: *mut c_char,
         rel: pg_sys::Relation,
@@ -102,6 +107,7 @@ unsafe extern "C" {
     );
     fn pg_attach_verify_btree_metapage(page: *mut c_char, all_equal_image: bool) -> bool;
     fn pg_attach_btree_metadata(rel: pg_sys::Relation, metadata: *mut RawBtreeMetadata);
+    fn pg_attach_btree_metapage_signature(rel: pg_sys::Relation) -> *const c_char;
     fn pg_attach_max_toast_chunk_size() -> c_int;
     fn pg_attach_max_identifier_length() -> c_int;
     fn pg_attach_checksum_algorithm_version() -> c_int;
@@ -229,6 +235,13 @@ impl Rel {
         unsafe { CStr::from_ptr((*(*self.0).rd_rel).relname.data.as_ptr()) }
             .to_string_lossy()
             .into_owned()
+    }
+
+    pub fn visibility_map(&self) -> VisibilityMap<'_> {
+        VisibilityMap {
+            relation: self,
+            buffer: pg_sys::InvalidBuffer.cast_signed(),
+        }
     }
 
     pub fn index_oids(&self) -> Vec<pg_sys::Oid> {
@@ -394,16 +407,14 @@ impl Rel {
         }
     }
 
-    pub fn visibility_map(&self) -> VisibilityMap<'_> {
-        VisibilityMap {
-            relation: self,
-            buffer: pg_sys::InvalidBuffer.cast_signed(),
-        }
-    }
-
     pub fn heap_page_is_frozen(page: &[u8]) -> bool {
         assert_eq!(page.len(), PAGE_SIZE);
         unsafe { guard(|| pg_attach_heap_page_is_frozen(page.as_ptr().cast())) }
+    }
+
+    pub fn assert_heap_page_frozen(&self, block: u32, page: &[u8]) {
+        assert_eq!(page.len(), PAGE_SIZE);
+        unsafe { guard(|| pg_attach_assert_heap_page_frozen(self.0, page.as_ptr().cast(), block)) }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -462,6 +473,14 @@ pub fn data_checksums_enabled() -> bool {
 pub fn index_definition(oid: pg_sys::Oid) -> String {
     let definition = unsafe { guard(|| pg_attach_index_definition(oid)) };
     unsafe { CStr::from_ptr(definition) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub fn btree_metapage_signature(oid: pg_sys::Oid) -> String {
+    let rel = unsafe { Rel::open(oid, pg_sys::ShareLock.cast_signed()) };
+    let signature = unsafe { guard(|| pg_attach_btree_metapage_signature(rel.0)) };
+    unsafe { CStr::from_ptr(signature) }
         .to_string_lossy()
         .into_owned()
 }

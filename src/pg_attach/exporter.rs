@@ -110,6 +110,58 @@ pub unsafe fn build_manifest(
     })
 }
 
+fn relation_catalog_signature(oid: pg_sys::Oid) -> Result<String, String> {
+    Spi::get_one_with_args::<String>(
+        "SELECT format('%s|%s|%s|%s|%s|%s|%s|%s', relfilenode, reltoastrelid, relnatts, \
+         relpages, relkind, relpersistence, relfrozenxid, relminmxid) \
+         FROM pg_catalog.pg_class WHERE oid = $1",
+        &[oid.into()],
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "source relation catalog metadata is missing".to_owned())
+}
+
+/// Snapshot all source metadata that must remain unchanged across checkpoint.
+/// The value is deliberately opaque to the client; it is compared only with a
+/// second snapshot on the same source server.
+///
+/// # Safety
+/// Runs inside PostgreSQL with the source relation lock held by the caller.
+pub unsafe fn source_metadata(source_table: &str) -> Result<String, String> {
+    let source_oid = ffi::resolve_relation(source_table)?;
+    let source = Rel::open(source_oid, pg_sys::ShareLock.cast_signed());
+    let source_toast = source.toast_oid();
+    let manifest = build_manifest(
+        source_table,
+        source_table,
+        source_toast,
+        ffi::data_checksums_enabled(),
+    )?;
+    let encoded = manifest.encode().map_err(|error| error.to_string())?;
+    let mut snapshot = String::with_capacity(encoded.len() * 2 + 256);
+    for byte in encoded {
+        use std::fmt::Write as _;
+        write!(snapshot, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    for relation in manifest
+        .relations
+        .iter()
+        .filter(|relation| relation.fork == u8::try_from(MAIN_FORK).expect("main fork fits u8"))
+    {
+        snapshot.push('|');
+        snapshot.push_str(&relation_catalog_signature(pg_sys::Oid::from(
+            relation.oid,
+        ))?);
+        if relation.kind == RelationKind::Index {
+            snapshot.push('|');
+            snapshot.push_str(&ffi::btree_metapage_signature(pg_sys::Oid::from(
+                relation.oid,
+            )));
+        }
+    }
+    Ok(snapshot)
+}
+
 /// Export only catalog metadata needed to recreate a table. No SQL dump tool or
 /// server-side procedural language is involved; the descriptor is binary.
 #[allow(clippy::too_many_lines)] // Keep catalog reads and descriptor order in one transaction.
@@ -328,6 +380,11 @@ impl ExportState {
                 .unwrap_or_else(|error| panic!("pg_attach: {error}"));
             let mut page = vec![0u8; PAGE_SIZE];
             relation.read_page(fork, self.block, &mut page);
+            if fork == MAIN_FORK
+                && matches!(metadata.kind, RelationKind::Main | RelationKind::Toast)
+            {
+                relation.assert_heap_page_frozen(self.block, &page);
+            }
             if fork == MAIN_FORK {
                 match metadata.kind {
                     RelationKind::Main | RelationKind::Toast => relation.prepare_heap_page(
@@ -382,6 +439,8 @@ pub unsafe fn export_stream(
 }
 
 fn relation_is_frozen(relation: &Rel) -> bool {
+    // VM_ALL_FROZEN skips data-page reads; streaming still proves every tuple,
+    // so a stale or lying VM bit cannot corrupt the transfer.
     let mut page = vec![0u8; PAGE_SIZE];
     let mut vm_skipped = 0u32;
     let mut pages_read = 0u32;

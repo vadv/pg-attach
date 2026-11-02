@@ -158,6 +158,17 @@ pub mod pg_attach {
             .unwrap_or_else(|error| panic!("pg_attach: {error}"))
     }
 
+    /// Return an opaque source metadata snapshot for the checkpoint consistency check.
+    ///
+    /// # Panics
+    /// Panics if the source relation or its catalog metadata cannot be read.
+    #[must_use]
+    #[pg_extern]
+    pub fn pg_attach_source_metadata(source_table: &str) -> String {
+        unsafe { exporter::source_metadata(source_table) }
+            .unwrap_or_else(|error| panic!("pg_attach: source metadata snapshot failed: {error}"))
+    }
+
     /// Export a compact, target-name-independent schema descriptor.
     ///
     /// # Panics
