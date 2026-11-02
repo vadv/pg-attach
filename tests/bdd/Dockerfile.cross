@@ -1,0 +1,67 @@
+ARG SOURCE_PG_VERSION=17
+ARG TARGET_PG_VERSION=18
+
+FROM rust:1.99-bookworm AS build
+RUN rustup component add clippy
+WORKDIR /work
+COPY tests/bdd/Cargo.toml tests/bdd/Cargo.lock ./
+COPY tests/bdd/main.rs tests/bdd/postgres.rs tests/bdd/steps.rs tests/bdd/world.rs ./
+RUN cargo clippy --release --all-targets --locked -- -D warnings -D clippy::pedantic \
+    && cargo test --release --locked \
+    && cargo build --release --locked
+
+FROM pg-attach-pg16:dev AS extension16
+FROM pg-attach-pg17:dev AS extension17
+FROM pg-attach-pg18:dev AS extension18
+
+FROM postgres:16-bookworm AS fixtures16
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc postgresql-server-dev-16 \
+    && rm -rf /var/lib/apt/lists/*
+COPY tests/bdd/fixtures.c /tmp/fixtures.c
+RUN cc -shared -fPIC -Wall -Werror \
+    -I"$(/usr/lib/postgresql/16/bin/pg_config --includedir-server)" \
+    /tmp/fixtures.c -o /tmp/pg_attach_bdd_fixtures.so
+
+FROM postgres:17-bookworm AS fixtures17
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc postgresql-server-dev-17 \
+    && rm -rf /var/lib/apt/lists/*
+COPY tests/bdd/fixtures.c /tmp/fixtures.c
+RUN cc -shared -fPIC -Wall -Werror \
+    -I"$(/usr/lib/postgresql/17/bin/pg_config --includedir-server)" \
+    /tmp/fixtures.c -o /tmp/pg_attach_bdd_fixtures.so
+
+FROM postgres:18-bookworm AS fixtures18
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gcc postgresql-server-dev-18 \
+    && rm -rf /var/lib/apt/lists/*
+COPY tests/bdd/fixtures.c /tmp/fixtures.c
+RUN cc -shared -fPIC -Wall -Werror \
+    -I"$(/usr/lib/postgresql/18/bin/pg_config --includedir-server)" \
+    /tmp/fixtures.c -o /tmp/pg_attach_bdd_fixtures.so
+
+FROM pg-attach-pg${TARGET_PG_VERSION}:dev
+ARG SOURCE_PG_VERSION
+ARG TARGET_PG_VERSION
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       postgresql-16 postgresql-17 postgresql-18 \
+       postgresql-contrib-16 postgresql-contrib-17 postgresql-contrib-18 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=extension16 /usr/lib/postgresql/16/lib/pg_attach.so /usr/lib/postgresql/16/lib/pg_attach.so
+COPY --from=extension16 /usr/share/postgresql/16/extension/pg_attach* /usr/share/postgresql/16/extension/
+COPY --from=extension17 /usr/lib/postgresql/17/lib/pg_attach.so /usr/lib/postgresql/17/lib/pg_attach.so
+COPY --from=extension17 /usr/share/postgresql/17/extension/pg_attach* /usr/share/postgresql/17/extension/
+COPY --from=extension18 /usr/lib/postgresql/18/lib/pg_attach.so /usr/lib/postgresql/18/lib/pg_attach.so
+COPY --from=extension18 /usr/share/postgresql/18/extension/pg_attach* /usr/share/postgresql/18/extension/
+COPY --from=fixtures16 /tmp/pg_attach_bdd_fixtures.so /usr/lib/postgresql/16/lib/
+COPY --from=fixtures17 /tmp/pg_attach_bdd_fixtures.so /usr/lib/postgresql/17/lib/
+COPY --from=fixtures18 /tmp/pg_attach_bdd_fixtures.so /usr/lib/postgresql/18/lib/
+COPY --from=build /work/target/release/pg-attach-bdd /usr/local/bin/pg-attach-bdd
+COPY tests/bdd/cross-features /opt/pg-attach-bdd/cross-features
+ENV PG_VERSION=${TARGET_PG_VERSION} \
+    PG_ATTACH_SOURCE_MAJOR=${SOURCE_PG_VERSION} \
+    PG_ATTACH_TARGET_MAJOR=${TARGET_PG_VERSION} \
+    PG_ATTACH_FEATURES=/opt/pg-attach-bdd/cross-features
+CMD ["pg-attach-bdd"]

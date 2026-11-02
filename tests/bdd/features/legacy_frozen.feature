@@ -50,7 +50,7 @@ Feature: Legacy frozen tuple representation is rejected, not imported
       """
       SELECT count(*) FROM pg_check_frozen('public.events');
       """
-    And the following SQL on "target" fails with "contains a tuple that is not frozen":
+    And the following SQL on "target" fails with "is not frozen":
       """
       SELECT pg_attach_import(
         'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',

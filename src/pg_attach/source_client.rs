@@ -57,11 +57,13 @@ struct ServerInfo {
     server_encoding: String,
     data_checksums: bool,
     extension_version: String,
+    max_toast_chunk_size: i32,
+    max_identifier_length: i32,
+    checksum_algorithm_version: i32,
 }
 
 impl ServerInfo {
     fn local() -> Result<Self, String> {
-        // Keep target compatibility reads from assigning an XID.
         let server_encoding = Spi::connect(|client| {
             client
                 .select("SELECT current_setting('server_encoding')", Some(1), &[])?
@@ -70,18 +72,16 @@ impl ServerInfo {
         })
         .map_err(|error| error.to_string())?
         .ok_or_else(|| "target server encoding is NULL".to_owned())?;
-        let extension_version = Spi::connect(|client| {
-            client
-                .select(
-                    "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_attach'",
-                    Some(1),
-                    &[],
-                )?
-                .first()
-                .get_one::<String>()
-        })
-        .map_err(|error| error.to_string())?
-        .ok_or_else(|| "target extension version is missing".to_owned())?;
+        let extension_version =
+            Spi::connect(|client| {
+                client.select(
+                "SELECT extversion FROM pg_catalog.pg_extension WHERE extname = 'pg_attach'",
+                Some(1),
+                &[],
+            )?.first().get_one::<String>()
+            })
+            .map_err(|error| error.to_string())?
+            .ok_or_else(|| "target extension version is missing".to_owned())?;
         Ok(Self {
             server_version_num: i32::try_from(pg_sys::PG_VERSION_NUM)
                 .expect("server version fits i32"),
@@ -96,15 +96,23 @@ impl ServerInfo {
             server_encoding,
             data_checksums: ffi::data_checksums_enabled(),
             extension_version,
+            max_toast_chunk_size: ffi::max_toast_chunk_size(),
+            max_identifier_length: ffi::max_identifier_length(),
+            checksum_algorithm_version: ffi::checksum_algorithm_version(),
         })
     }
 
     fn ensure_compatible(&self, target: &Self) -> Result<(), String> {
-        ensure_equal(
-            "PostgreSQL major",
-            &(self.server_version_num / 10000),
-            &(target.server_version_num / 10000),
-        )?;
+        let source_major = self.server_version_num / 10000;
+        let target_major = target.server_version_num / 10000;
+        if !(16..=18).contains(&source_major)
+            || !(16..=18).contains(&target_major)
+            || source_major > target_major
+        {
+            return Err(format!(
+                "unsupported PostgreSQL major pair {source_major} -> {target_major}; only same-major and upward 16-18 transfers are supported"
+            ));
+        }
         ensure_equal(
             "extension version",
             &self.extension_version,
@@ -122,6 +130,21 @@ impl ServerInfo {
             "data checksums",
             &self.data_checksums,
             &target.data_checksums,
+        )?;
+        ensure_equal(
+            "TOAST chunk size",
+            &self.max_toast_chunk_size,
+            &target.max_toast_chunk_size,
+        )?;
+        ensure_equal(
+            "identifier length",
+            &self.max_identifier_length,
+            &target.max_identifier_length,
+        )?;
+        ensure_equal(
+            "checksum algorithm",
+            &self.checksum_algorithm_version,
+            &target.checksum_algorithm_version,
         )
     }
 
@@ -135,7 +158,7 @@ impl ServerInfo {
                 .map_err(|_| format!("source server info column {column} is not UTF-8"))?;
             Ok(value.to_owned())
         };
-        Ok(Self {
+        let info = Self {
             server_version_num: parse_i32(&value(0)?, "server version")?,
             block_size: parse_i32(&value(1)?, "block size")?,
             max_align: parse_i32(&value(2)?, "max align")?,
@@ -143,7 +166,12 @@ impl ServerInfo {
             server_encoding: value(4)?,
             data_checksums: parse_bool(&value(5)?, "data checksums")?,
             extension_version: value(6)?,
-        })
+            max_toast_chunk_size: parse_i32(&value(7)?, "TOAST chunk size")?,
+            max_identifier_length: parse_i32(&value(8)?, "identifier length")?,
+            checksum_algorithm_version: parse_i32(&value(9)?, "checksum algorithm")?,
+        };
+        parse_bool(&value(10)?, "lz4 support")?;
+        Ok(info)
     }
 }
 
@@ -173,6 +201,10 @@ fn parse_bool(value: &str, field: &str) -> Result<bool, String> {
         "f" => Ok(false),
         _ => Err(format!("invalid source {field}: {value}")),
     }
+}
+
+fn stage_error(stage: &str, error: &str) -> String {
+    format!("pg_attach stage={stage}: {error}")
 }
 
 fn strip_copy_file_header(row: &[u8]) -> Result<&[u8], String> {
@@ -299,7 +331,7 @@ impl SourceClient {
         let result = unsafe {
             PQexec(
                 self.conn,
-                c"SELECT server_version_num, block_size, max_align, endianness, server_encoding, data_checksums, extension_version FROM pg_attach_server_info()"
+                c"SELECT server_version_num, block_size, max_align, endianness, server_encoding, data_checksums, extension_version, max_toast_chunk_size, max_identifier_length, checksum_algorithm_version, lz4_supported FROM pg_attach_server_info()"
                     .as_ptr(),
             )
         };
@@ -318,8 +350,8 @@ impl SourceClient {
                     message
                 });
             }
-            if unsafe { PQntuples(result) } != 1 || unsafe { PQnfields(result) } != 7 {
-                return Err("source server info must return one row with seven columns".to_owned());
+            if unsafe { PQntuples(result) } != 1 || unsafe { PQnfields(result) } != 11 {
+                return Err("source server info must return one row with eleven columns".to_owned());
             }
             ServerInfo::decode(result)
         })();
@@ -340,32 +372,81 @@ impl SourceClient {
         // shortcut: three attempts bound writer starvation; add a policy only for production.
         const MAX_ATTEMPTS: u8 = 3;
         let literal = format!("'{}'", source_table.replace('\'', "''"));
+        let lock = format!("SELECT pg_attach_lock_source({literal})");
+
+        // Probe the lock before VACUUM so unsupported/uncooperative sources fail
+        // without modifying the table. The actual lock is reacquired below.
+        self.execute("BEGIN")
+            .map_err(|error| stage_error("begin", &error))?;
+        if let Err(error) = self.execute(&lock) {
+            let _ = self.rollback();
+            return Err(stage_error("lock", &error));
+        }
+        self.rollback()
+            .map_err(|error| stage_error("rollback", &error))?;
+
         for attempt in 1..=MAX_ATTEMPTS {
-            let vacuum = self.query_text(
-                "SELECT format('VACUUM (FREEZE) %I.%I', parts[1], parts[2]) \
+            let vacuum = self
+                .query_text(
+                    "SELECT format('VACUUM (FREEZE) %I.%I', parts[1], parts[2]) \
                  FROM (SELECT parse_ident($1) AS parts) AS parsed \
                  WHERE array_length(parts, 1) = 2",
-                source_table,
-            )?;
-            self.execute(&vacuum)?;
-            self.execute("BEGIN")?;
-            let locked = self.execute(&format!("SELECT pg_attach_lock_source({literal})"));
-            if let Err(error) = locked {
-                let _ = self.execute("ROLLBACK");
-                return Err(error);
+                    source_table,
+                )
+                .map_err(|error| stage_error("vacuum", &error))?;
+            self.execute(&vacuum)
+                .map_err(|error| stage_error("vacuum", &error))?;
+            self.execute("BEGIN")
+                .map_err(|error| stage_error("begin", &error))?;
+            if let Err(error) = self.execute(&lock) {
+                let _ = self.rollback();
+                return Err(stage_error("lock", &error));
             }
+            let metadata =
+                match self.query_text("SELECT pg_attach_source_metadata($1)", source_table) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let _ = self.rollback();
+                        return Err(stage_error("metadata", &error));
+                    }
+                };
             match self.query_text("SELECT pg_attach_source_is_frozen($1)", source_table) {
                 Ok(value) if value == "t" => {
+                    pgrx::log!(
+                        "pg_attach: source frozen on attempt {attempt}/{MAX_ATTEMPTS}; CHECKPOINT"
+                    );
                     let checkpoint = Self::connect(&self.conninfo)
                         .and_then(|mut client| client.execute("CHECKPOINT"));
                     if let Err(error) = checkpoint {
-                        let _ = self.execute("ROLLBACK");
-                        return Err(error);
+                        let _ = self.rollback();
+                        pgrx::warning!("pg_attach: CHECKPOINT failed: {error}");
+                        return Err(stage_error("checkpoint", &error));
                     }
+                    let after = match self
+                        .query_text("SELECT pg_attach_source_metadata($1)", source_table)
+                    {
+                        Ok(value) => value,
+                        Err(error) => {
+                            let _ = self.rollback();
+                            return Err(stage_error("metadata", &error));
+                        }
+                    };
+                    if after != metadata {
+                        let _ = self.rollback();
+                        return Err(
+                            "pg_attach: source metadata changed after CHECKPOINT; import aborted"
+                                .to_owned(),
+                        );
+                    }
+                    pgrx::log!("pg_attach: CHECKPOINT complete; source metadata unchanged");
                     return Ok(());
                 }
                 Ok(value) if value == "f" => {
-                    self.execute("ROLLBACK")?;
+                    self.rollback()
+                        .map_err(|error| stage_error("rollback", &error))?;
+                    pgrx::warning!(
+                        "pg_attach: attempt {attempt}/{MAX_ATTEMPTS}: source changed after freeze; retrying VACUUM"
+                    );
                     if attempt == MAX_ATTEMPTS {
                         return Err(
                             "source table did not remain frozen after 3 VACUUM FREEZE attempts"
@@ -374,20 +455,29 @@ impl SourceClient {
                     }
                 }
                 Ok(value) => {
-                    let _ = self.execute("ROLLBACK");
-                    return Err(format!("unexpected frozen validation result: {value}"));
+                    let _ = self.rollback();
+                    return Err(stage_error(
+                        "validate",
+                        &format!("unexpected frozen validation result: {value}"),
+                    ));
                 }
                 Err(error) => {
-                    let _ = self.execute("ROLLBACK");
-                    return Err(error);
+                    let _ = self.rollback();
+                    return Err(stage_error("validate", &error));
                 }
             }
         }
         unreachable!("bounded VACUUM FREEZE loop always returns")
     }
 
+    pub fn rollback(&mut self) -> Result<(), String> {
+        self.execute("ROLLBACK")
+            .map_err(|error| stage_error("rollback", &error))
+    }
+
     pub fn commit(&mut self) -> Result<(), String> {
         self.execute("COMMIT")
+            .map_err(|error| stage_error("commit", &error))
     }
 
     pub fn schema(&mut self, source_table: &str) -> Result<TableSchema, String> {
@@ -521,7 +611,10 @@ mod tests {
             endianness: "little".to_owned(),
             server_encoding: "UTF8".to_owned(),
             data_checksums: true,
-            extension_version: "0.2.0".to_owned(),
+            extension_version: "0.3.0".to_owned(),
+            max_toast_chunk_size: 1996,
+            max_identifier_length: 63,
+            checksum_algorithm_version: 1,
         }
     }
 
@@ -536,14 +629,34 @@ mod tests {
     }
 
     #[test]
-    fn rejects_different_major() {
-        let target = server_info();
-        let source = ServerInfo {
-            server_version_num: 180_001,
-            ..target.clone()
-        };
-        let error = source.ensure_compatible(&target).unwrap_err();
-        assert!(error.contains("PostgreSQL major"), "{error}");
+    fn accepts_only_same_major_and_upward_pairs() {
+        for (source_major, target_major) in [(16, 17), (16, 18), (17, 18)] {
+            let target = ServerInfo {
+                server_version_num: target_major * 10000,
+                ..server_info()
+            };
+            let source = ServerInfo {
+                server_version_num: source_major * 10000,
+                ..target.clone()
+            };
+            assert!(source.ensure_compatible(&target).is_ok());
+        }
+    }
+
+    #[test]
+    fn rejects_downgrade_and_unsupported_major_pairs() {
+        for (source_major, target_major) in [(17, 16), (18, 16), (18, 17), (15, 16), (16, 19)] {
+            let target = ServerInfo {
+                server_version_num: target_major * 10000,
+                ..server_info()
+            };
+            let source = ServerInfo {
+                server_version_num: source_major * 10000,
+                ..target.clone()
+            };
+            let error = source.ensure_compatible(&target).unwrap_err();
+            assert!(error.contains("PostgreSQL major"), "{error}");
+        }
     }
 
     #[test]
@@ -593,6 +706,27 @@ mod tests {
                 "data checksums",
                 ServerInfo {
                     data_checksums: false,
+                    ..target.clone()
+                },
+            ),
+            (
+                "TOAST chunk size",
+                ServerInfo {
+                    max_toast_chunk_size: 1024,
+                    ..target.clone()
+                },
+            ),
+            (
+                "identifier length",
+                ServerInfo {
+                    max_identifier_length: 31,
+                    ..target.clone()
+                },
+            ),
+            (
+                "checksum algorithm",
+                ServerInfo {
+                    checksum_algorithm_version: 2,
                     ..target.clone()
                 },
             ),

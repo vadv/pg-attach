@@ -1,6 +1,10 @@
 ARG PG_VERSION=17
 
-FROM rust:1.99-bookworm AS build
+# Toolchain layers are cached as a prebuilt builder image
+# (ghcr.io/<repo>/builder-pg<N>:<hash of Dockerfile+Cargo.lock>);
+# see .github/workflows/images.yml and the BUILDER_REGISTRY logic in
+# tests/bdd/run.sh.
+FROM rust:1.99-bookworm AS toolchain
 ARG PG_VERSION
 
 RUN rustup component add rustfmt clippy
@@ -19,6 +23,11 @@ RUN cargo pgrx init --pg${PG_VERSION} /usr/lib/postgresql/${PG_VERSION}/bin/pg_c
 
 WORKDIR /src
 COPY Cargo.toml Cargo.lock build.rs pg_attach.control ./
+# Stub lib: cargo fetch validates the manifest before downloading; the real
+# src/ is copied in the build stage and overwrites this file.
+RUN mkdir -p src && echo '' > src/lib.rs && cargo fetch --locked
+
+FROM toolchain AS build
 COPY src ./src
 RUN cargo fmt --all -- --check \
     && cargo test --locked --no-default-features --features "pg${PG_VERSION}" \

@@ -64,28 +64,10 @@ pub unsafe fn build_manifest(
         return Err("target table must have a TOAST relation".into());
     }
 
-    let attributes = source
-        .attributes()
-        .into_iter()
-        .map(|attribute| {
-            let end = attribute
-                .name
-                .iter()
-                .position(|byte| *byte == 0)
-                .unwrap_or(attribute.name.len());
-            wire::Attribute {
-                name: String::from_utf8_lossy(&attribute.name[..end]).into_owned(),
-                type_oid: attribute.type_oid.to_u32(),
-                collation_oid: attribute.collation_oid.to_u32(),
-                typmod: attribute.typmod,
-                len: attribute.len,
-                not_null: attribute.not_null,
-                dropped: attribute.dropped,
-            }
-        })
-        .collect();
-
+    let attributes = source.attributes()?;
+    wire::validate_attributes(&attributes)?;
     let mut relations = Vec::new();
+    let mut indexes = Vec::new();
     push_relation(&mut relations, source_oid, &source, RelationKind::Main);
 
     if source_toast != pg_sys::Oid::INVALID {
@@ -105,27 +87,79 @@ pub unsafe fn build_manifest(
             &toast_index,
             RelationKind::Index,
         );
+        indexes.push(ffi::index_metadata(toast_index_oid)?);
     }
 
-    let index_oids = source.index_oids();
-    let mut index_definitions = Vec::with_capacity(index_oids.len());
-    for index_oid in index_oids {
+    for index_oid in source.index_oids() {
         let index = Rel::open(index_oid, pg_sys::ShareLock.cast_signed());
         if !index.is_btree() {
             return Err(format!("index {} is not a btree", index.name()));
         }
         push_relation(&mut relations, index_oid, &index, RelationKind::Index);
-        index_definitions.push(ffi::index_definition(index_oid));
+        indexes.push(ffi::index_metadata(index_oid)?);
     }
 
     Ok(Manifest {
         source_table: source_table.to_owned(),
         target_table: target_table.to_owned(),
-        checksums: target_checksums,
+        source_checksums: ffi::data_checksums_enabled(),
+        target_checksums,
         relations,
         attributes,
-        index_definitions,
+        indexes,
     })
+}
+
+fn relation_catalog_signature(oid: pg_sys::Oid) -> Result<String, String> {
+    Spi::get_one_with_args::<String>(
+        "SELECT format('%s|%s|%s|%s|%s|%s|%s|%s', relfilenode, reltoastrelid, relnatts, \
+         relpages, relkind, relpersistence, relfrozenxid, relminmxid) \
+         FROM pg_catalog.pg_class WHERE oid = $1",
+        &[oid.into()],
+    )
+    .map_err(|error| error.to_string())?
+    .ok_or_else(|| "source relation catalog metadata is missing".to_owned())
+}
+
+/// Snapshot all source metadata that must remain unchanged across checkpoint.
+/// The value is deliberately opaque to the client; it is compared only with a
+/// second snapshot on the same source server.
+///
+/// # Safety
+/// Runs inside PostgreSQL with the source relation lock held by the caller.
+pub unsafe fn source_metadata(source_table: &str) -> Result<String, String> {
+    let source_oid = ffi::resolve_relation(source_table)?;
+    let source = Rel::open(source_oid, pg_sys::ShareLock.cast_signed());
+    let source_toast = source.toast_oid();
+    let manifest = build_manifest(
+        source_table,
+        source_table,
+        source_toast,
+        ffi::data_checksums_enabled(),
+    )?;
+    let encoded = manifest.encode().map_err(|error| error.to_string())?;
+    let mut snapshot = String::with_capacity(encoded.len() * 2 + 256);
+    for byte in encoded {
+        use std::fmt::Write as _;
+        write!(snapshot, "{byte:02x}").expect("writing to String cannot fail");
+    }
+    for relation in manifest
+        .relations
+        .iter()
+        .filter(|relation| relation.fork == u8::try_from(MAIN_FORK).expect("main fork fits u8"))
+    {
+        snapshot.push('|');
+        snapshot.push_str(&relation_catalog_signature(pg_sys::Oid::from(
+            relation.oid,
+        ))?);
+        if relation.kind == RelationKind::Index {
+            snapshot.push('|');
+            snapshot.push_str(&ffi::btree_metapage_signature(pg_sys::Oid::from(
+                relation.oid,
+            )));
+        }
+    }
+    Ok(snapshot)
 }
 
 /// Export only catalog metadata needed to recreate a table. No SQL dump tool or
@@ -146,15 +180,21 @@ pub unsafe fn export_schema(source_table: &str) -> Result<Vec<u8>, String> {
     let columns = Spi::connect_mut(|client| {
         let rows = client
             .select(
-                "SELECT a.attname::text, CASE WHEN a.attisdropped THEN 'text' \
-                 ELSE format_type(a.atttypid, a.atttypmod) END, \
+                "SELECT a.attname::text, CASE WHEN NOT a.attisdropped THEN format_type(a.atttypid, a.atttypmod) \
+                 WHEN a.attlen = -1 AND a.attcollation = 0 THEN 'bytea' \
+                 WHEN a.attlen = -1 THEN 'text' \
+                 WHEN a.attlen = 1 THEN 'boolean' \
+                 WHEN a.attlen = 2 THEN 'smallint' \
+                 WHEN a.attlen = 4 THEN 'integer' \
+                 WHEN a.attlen = 8 THEN 'bigint' \
+                 ELSE 'text' END, \
                  CASE WHEN a.attcollation <> 0 AND a.attcollation <> t.typcollation \
                  THEN (SELECT format('%I.%I', n.nspname, c.collname) \
                        FROM pg_collation c JOIN pg_namespace n ON n.oid = c.collnamespace \
                        WHERE c.oid = a.attcollation) END, \
                  pg_get_expr(d.adbin, d.adrelid), a.attnotnull, a.attidentity::text, \
                  CASE WHEN a.attgenerated <> '' THEN pg_get_expr(d.adbin, d.adrelid) END, \
-                 a.attisdropped \
+                 a.attisdropped, a.attstorage::text \
                  FROM pg_attribute a LEFT JOIN pg_type t ON t.oid = a.atttypid \
                  LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum \
                  WHERE a.attrelid = $1 AND a.attnum > 0 ORDER BY a.attnum",
@@ -184,6 +224,11 @@ pub unsafe fn export_schema(source_table: &str) -> Result<Vec<u8>, String> {
                     .map_err(|error| error.to_string())?
                     .unwrap_or_default(),
                 generated_expr: row.get::<String>(7).map_err(|error| error.to_string())?,
+                storage: row
+                    .get::<String>(9)
+                    .map_err(|error| error.to_string())?
+                    .and_then(|value| value.into_bytes().first().copied())
+                    .ok_or_else(|| "source attribute storage is empty".to_owned())?,
                 dropped: row
                     .get::<bool>(8)
                     .map_err(|error| error.to_string())?
@@ -270,6 +315,7 @@ struct ExportState {
     manifest: Manifest,
     source_toast_oid: pg_sys::Oid,
     target_toast_oid: pg_sys::Oid,
+    target_lz4_supported: bool,
     header_pending: bool,
     relation_index: usize,
     block: u32,
@@ -281,6 +327,7 @@ impl ExportState {
         source_table: &str,
         target_table: &str,
         target_toast_oid: pg_sys::Oid,
+        target_lz4_supported: bool,
         target_checksums: bool,
     ) -> Result<Self, String> {
         let manifest = build_manifest(
@@ -295,6 +342,7 @@ impl ExportState {
             manifest,
             source_toast_oid: source_main.toast_oid(),
             target_toast_oid,
+            target_lz4_supported,
             header_pending: true,
             relation_index: 0,
             block: 0,
@@ -322,7 +370,6 @@ impl ExportState {
                 continue;
             }
 
-            // SRF cleanup may run under another ResourceOwner; close each Rel in its call.
             let relation = unsafe {
                 Rel::open(
                     pg_sys::Oid::from_u32(metadata.oid),
@@ -333,6 +380,11 @@ impl ExportState {
                 .unwrap_or_else(|error| panic!("pg_attach: {error}"));
             let mut page = vec![0u8; PAGE_SIZE];
             relation.read_page(fork, self.block, &mut page);
+            if fork == MAIN_FORK
+                && matches!(metadata.kind, RelationKind::Main | RelationKind::Toast)
+            {
+                relation.assert_heap_page_frozen(self.block, &page);
+            }
             if fork == MAIN_FORK {
                 match metadata.kind {
                     RelationKind::Main | RelationKind::Toast => relation.prepare_heap_page(
@@ -342,10 +394,11 @@ impl ExportState {
                         self.target_toast_oid,
                         metadata.kind == RelationKind::Main
                             && self.source_toast_oid != pg_sys::Oid::INVALID,
-                        self.manifest.checksums,
+                        self.target_lz4_supported,
+                        self.manifest.target_checksums,
                     ),
                     RelationKind::Index => {
-                        Rel::prepare_page(self.block, &mut page, self.manifest.checksums);
+                        Rel::prepare_page(self.block, &mut page, self.manifest.target_checksums);
                     }
                 }
             }
@@ -371,12 +424,14 @@ pub unsafe fn export_stream(
     source_table: &str,
     target_table: &str,
     target_toast_oid: pg_sys::Oid,
+    target_lz4_supported: bool,
     target_checksums: bool,
 ) -> SetOfIterator<'static, Vec<u8>> {
     let mut state = ExportState::new(
         source_table,
         target_table,
         target_toast_oid,
+        target_lz4_supported,
         target_checksums,
     )
     .unwrap_or_else(|error| panic!("pg_attach: {error}"));
@@ -384,6 +439,8 @@ pub unsafe fn export_stream(
 }
 
 fn relation_is_frozen(relation: &Rel) -> bool {
+    // VM_ALL_FROZEN skips data-page reads; streaming still proves every tuple,
+    // so a stale or lying VM bit cannot corrupt the transfer.
     let mut page = vec![0u8; PAGE_SIZE];
     let mut vm_skipped = 0u32;
     let mut pages_read = 0u32;

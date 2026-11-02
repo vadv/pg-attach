@@ -7,9 +7,38 @@
 #include "access/table.h"
 #include "access/xloginsert.h"
 #include "storage/bufmgr.h"
+#include "storage/smgr.h"
 
 PG_MODULE_MAGIC;
 PG_FUNCTION_INFO_V1(pg_attach_test_legacy_xmin);
+PG_FUNCTION_INFO_V1(pg_attach_test_corrupt_page);
+
+Datum
+pg_attach_test_corrupt_page(PG_FUNCTION_ARGS)
+{
+    Relation rel;
+    SMgrRelation smgr;
+    BlockNumber blkno;
+    int offset;
+    Page page;
+
+    if (!superuser())
+        elog(ERROR, "corruption fixture requires superuser");
+    rel = table_open(PG_GETARG_OID(0), AccessExclusiveLock);
+    blkno = PG_GETARG_INT32(1);
+    offset = PG_GETARG_INT32(2);
+    if (blkno >= RelationGetNumberOfBlocks(rel) || offset < 0 || offset >= BLCKSZ)
+        elog(ERROR, "corruption fixture requires an existing byte in the relation");
+    smgr = RelationGetSmgr(rel);
+    page = palloc(BLCKSZ);
+    smgrread(smgr, MAIN_FORKNUM, blkno, page);
+    page[offset] ^= 0xFF;
+    smgrwrite(smgr, MAIN_FORKNUM, blkno, page, false);
+    smgrimmedsync(smgr, MAIN_FORKNUM);
+    pfree(page);
+    table_close(rel, NoLock);
+    PG_RETURN_VOID();
+}
 
 Datum
 pg_attach_test_legacy_xmin(PG_FUNCTION_ARGS)

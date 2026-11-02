@@ -17,7 +17,8 @@ Feature: A committed writer between vacuum and lock triggers bounded retry
       DECLARE n bigint;
       BEGIN
         n := nextval('public.freeze_attempts');
-        IF n <= (SELECT attempts FROM public.fault_injection) THEN
+        -- The first call is prepare_direct's pre-VACUUM lock probe.
+        IF n > 1 AND n <= (SELECT attempts + 1 FROM public.fault_injection) THEN
           PERFORM dblink_exec(
             'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
             format('INSERT INTO public.events VALUES (%s)', 100 + n)
@@ -46,11 +47,11 @@ Feature: A committed writer between vacuum and lock triggers bounded retry
         'public.events', 'public.kept', true
       );
       """
-    Then the following SQL on "source" returns "2":
+    Then the following SQL on "source" returns "3":
       """
       SELECT last_value FROM public.freeze_attempts;
       """
-    And the following SQL on "target" returns "1,101":
+    And the following SQL on "target" returns "1,102":
       """
       SELECT string_agg(id::text, ',' ORDER BY id) FROM public.kept;
       """
@@ -74,7 +75,7 @@ Feature: A committed writer between vacuum and lock triggers bounded retry
         'public.events', 'public.<destination>', true
       );
       """
-    And the following SQL on "source" returns "3|4":
+    And the following SQL on "source" returns "4|4":
       """
       SELECT last_value, (SELECT count(*) FROM public.events) FROM public.freeze_attempts;
       """
@@ -100,11 +101,11 @@ Feature: A committed writer between vacuum and lock triggers bounded retry
         'public.events', 'public.<destination>', true
       );
       """
-    Then the following SQL on "source" returns "4":
+    Then the following SQL on "source" returns "6":
       """
       SELECT last_value FROM public.freeze_attempts;
       """
-    And the following SQL on "target" returns "1,101,102,103":
+    And the following SQL on "target" returns "1,102,103,104":
       """
       SELECT string_agg(id::text, ',' ORDER BY id) FROM public.<destination>;
       """

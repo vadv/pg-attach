@@ -6,6 +6,7 @@ on:
 
 permissions:
   contents: read
+  packages: read
 
 jobs:
   postgres-matrix:
@@ -18,9 +19,22 @@ jobs:
         pg: [16, 17, 18]
     env:
       PG_VERSION: ${{ matrix.pg }}
+      BUILDER_REGISTRY: ghcr.io/${{ github.repository }}
     steps:
       - name: Check out
         uses: actions/checkout@v4
+
+      - name: Log in to GHCR for builder cache
+        run: |
+          for attempt in 1 2 3; do
+            if echo "${{ secrets.GITHUB_TOKEN }}" \
+              | docker login ghcr.io -u '${{ github.actor }}' --password-stdin; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "ghcr login failed after 3 attempts" >&2
+          exit 1
 
       - name: Build, lint and run BDD scenarios
         run: make bdd
@@ -30,5 +44,50 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: bdd-logs-pg${{ matrix.pg }}
+          path: target/bdd-logs/
+          if-no-files-found: ignore
+
+  cross-major-matrix:
+    name: PostgreSQL ${{ matrix.source }} to ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - source: 16
+            target: 17
+          - source: 16
+            target: 18
+          - source: 17
+            target: 18
+    env:
+      SOURCE_PG_VERSION: ${{ matrix.source }}
+      TARGET_PG_VERSION: ${{ matrix.target }}
+      BUILDER_REGISTRY: ghcr.io/${{ github.repository }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR for builder cache
+        run: |
+          for attempt in 1 2 3; do
+            if echo "${{ secrets.GITHUB_TOKEN }}" \
+              | docker login ghcr.io -u '${{ github.actor }}' --password-stdin; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "ghcr login failed after 3 attempts" >&2
+          exit 1
+
+      - name: Build, lint and run cross-major BDD scenarios
+        run: make bdd PG_SOURCE=${{ matrix.source }} PG_TARGET=${{ matrix.target }}
+
+      - name: Upload cross-major BDD logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bdd-logs-pg${{ matrix.source }}-pg${{ matrix.target }}
           path: target/bdd-logs/
           if-no-files-found: ignore

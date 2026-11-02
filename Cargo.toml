@@ -1,10 +1,10 @@
 [package]
 name = "pg_attach"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.96"
 license = "PostgreSQL"
-description = "Physical table transfer between matching PostgreSQL 16-18 clusters"
+description = "Physical table transfer between PostgreSQL 16-18 clusters, including upward upgrades"
 autotests = false
 
 [lib]
