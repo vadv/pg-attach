@@ -55,7 +55,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Build, lint and run cross-major BDD scenarios
-        run: ./tests/bdd/run.sh
+        run: make bdd PG_SOURCE=${{ matrix.source }} PG_TARGET=${{ matrix.target }}
 
       - name: Upload cross-major BDD logs
         if: always()

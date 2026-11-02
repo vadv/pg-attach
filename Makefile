@@ -1,4 +1,6 @@
 PG_VERSION ?= 17
+PG_SOURCE ?= $(PG_VERSION)
+PG_TARGET ?= $(PG_VERSION)
 PG_CONFIG ?= pg_config
 CARGO ?= cargo
 
@@ -30,7 +32,7 @@ lint: check-pg-config
 	$(CARGO) clippy --manifest-path tests/bdd/Cargo.toml --all-targets --locked -- -D warnings -D clippy::pedantic
 
 bdd:
-	PG_VERSION=$(PG_VERSION) ./tests/bdd/run.sh
+	PG_VERSION=$(PG_TARGET) SOURCE_PG_VERSION=$(PG_SOURCE) TARGET_PG_VERSION=$(PG_TARGET) ./tests/bdd/run.sh
 
 clean:
 	$(CARGO) clean

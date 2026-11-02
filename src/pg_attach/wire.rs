@@ -153,7 +153,8 @@ pub fn validate_attributes(attributes: &[Attribute]) -> std::result::Result<(), 
         let base = attribute
             .type_name
             .strip_prefix("pg_catalog._")
-            .or_else(|| attribute.type_name.strip_prefix("pg_catalog."));
+            .or_else(|| attribute.type_name.strip_prefix("pg_catalog."))
+            .map(|base| base.trim_matches('"'));
         if !base.is_some_and(|base| SAFE_TYPES.contains(&base)) {
             return Err(format!(
                 "column {} has unsafe type {}; only built-in types without catalog OIDs in their values are supported",
@@ -758,6 +759,11 @@ mod tests {
             ..attribute()
         };
         assert!(validate_attributes(&[safe_array]).is_ok());
+        let quoted_safe_type = Attribute {
+            type_name: "pg_catalog.\"numeric\"".into(),
+            ..attribute()
+        };
+        assert!(validate_attributes(&[quoted_safe_type]).is_ok());
     }
 
     #[test]

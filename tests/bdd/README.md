@@ -10,9 +10,9 @@
 make bdd PG_VERSION=16
 make bdd PG_VERSION=17
 make bdd PG_VERSION=18
-SOURCE_PG_VERSION=16 TARGET_PG_VERSION=17 ./tests/bdd/run.sh
-SOURCE_PG_VERSION=16 TARGET_PG_VERSION=18 ./tests/bdd/run.sh
-SOURCE_PG_VERSION=17 TARGET_PG_VERSION=18 ./tests/bdd/run.sh
+make bdd PG_SOURCE=16 PG_TARGET=17
+make bdd PG_SOURCE=16 PG_TARGET=18
+make bdd PG_SOURCE=17 PG_TARGET=18
 ```
 
 `make bdd` собирает расширение со strict Clippy/tests, затем отдельный BDD image.

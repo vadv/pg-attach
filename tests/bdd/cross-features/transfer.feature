@@ -63,3 +63,41 @@ Feature: Upward physical transfer across PostgreSQL majors
       | 17           | 18           | enabled   | false |
       | 17           | 18           | disabled  | true  |
       | 17           | 18           | disabled  | false |
+
+  Scenario Outline: Built-in <type> values survive a 16 to 18 transfer
+    Given a fresh PostgreSQL 16 to 18 pair with checksums "enabled"
+    And the following SQL is executed on "source":
+      """
+      CREATE EXTENSION pg_attach;
+      CREATE TABLE public.events(id integer PRIMARY KEY, payload <type>);
+      INSERT INTO public.events VALUES (1, <value>);
+      """
+    And the following SQL is executed on "target":
+      """
+      CREATE EXTENSION pg_attach;
+      """
+    When the following SQL is executed on "target":
+      """
+      SELECT pg_attach_import(
+        'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
+        'public.events', 'public.imported_events', true
+      );
+      """
+    Then the following SQL on "target" returns "1|<expected>":
+      """
+      SELECT id, payload::text FROM public.imported_events;
+      """
+
+    Examples:
+      | type         | value                              | expected                    |
+      | numeric(10,3)| 12.340                             | 12.340                      |
+      | uuid         | '11111111-2222-3333-4444-555555555555' | 11111111-2222-3333-4444-555555555555 |
+      | jsonb        | '[1,2]'::jsonb                    | [1, 2]                      |
+      | timestamptz  | '2024-01-02 03:04:05+00'           | 2024-01-02 03:04:05+00      |
+      | bytea        | decode('0102', 'hex')              | \x0102                      |
+      | inet         | '192.168.1.1/24'                   | 192.168.1.1/24              |
+      | integer[]    | ARRAY[1, 2]                        | {1,2}                       |
+      | text[]       | ARRAY['a', 'b']                    | {a,b}                       |
+      | tsvector     | 'b:2 a:1'::tsvector                | 'a':1 'b':2                 |
+      | pg_lsn       | '0/16B6C50'::pg_lsn                | 0/16B6C50                   |
+      | varbit       | B'1010'                            | 1010                        |
