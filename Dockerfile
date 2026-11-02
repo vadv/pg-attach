@@ -1,7 +1,7 @@
 ARG PG_VERSION=17
 
 # Toolchain layers are cached as a prebuilt builder image
-# (ghcr.io/<repo>/builder-pg<N>:<hash of Dockerfile+Cargo.lock>);
+# (ghcr.io/<repo>/builder-pg<N>:<hash of Dockerfile+images.yml>);
 # see .github/workflows/images.yml and the BUILDER_REGISTRY logic in
 # tests/bdd/run.sh.
 FROM rust:1.99-bookworm AS toolchain

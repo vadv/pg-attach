@@ -7,31 +7,27 @@
 
 Анализ по текущему коду, по убыванию приоритета:
 
-1. **Состояние sequences** — correctness-дефект, не фича. Дескриптор
-   переносит `default_expr` (`pg_get_expr`), identity отвергается
-   (`importer.rs`), но `nextval`-default не отвергается и состояние
-   sequence не переносится: auto-create с serial создаёт таблицу, первый
-   INSERT падает `relation ... does not exist`; явный target оставляет
-   sequence на старом `last_value` → PK-конфликты после переноса. Фикс:
-   переносить `last_value` owned sequences target (`setval` после
-   импорта), в auto-create отвергать `nextval`-дефолты.
-2. **Прогресс переноса** — NOTICE каждые N страниц или прогресс-view в
+1. **Прогресс переноса** — NOTICE каждые N страниц или прогресс-view в
    стиле `pg_stat_progress`; на 10GB+ оператор должен видеть ход и ETA.
-3. **Физический перенос partial/expression btree** — сравнение выражений
+2. **Физический перенос partial/expression btree** — сравнение выражений
    в catalog + существующий page-путь; partial (`WHERE ...`) в реальных
    схемах — норма.
-4. **Физический перенос остальных AM по максимуму** — GiST/GIN/BRIN/Hash/
+3. **Физический перенос остальных AM по максимуму** — GiST/GIN/BRIN/Hash/
    SP-GiST добивать на уровне страниц, где физически возможно (invariants
    и recovery-история по каждому AM — ниже). Гибридный режим (heap/TOAST
    и поддержанные btree физически, остальное — `CREATE INDEX` на target)
    — только крайний fallback для случаев, где физический перенос
    невозможен в принципе; он не подменяет физическую работу по AM.
-5. **Partitioned tables** — минимум: перенос отдельных партиций (это
+4. **Partitioned tables** — минимум: перенос отдельных партиций (это
    обычные таблицы) + задокументированный паттерн цикла; далее атомарное
    окно на все партиции разом.
 
-Порядок атаки: 1 → 2 → 3 → 4 → 5. Не must: online без freeze, ACL
+Порядок атаки: 1 → 2 → 3 → 4. Не must: online без freeze, ACL
 (out of scope), DirectIO (оптимизация), PG19 до stable.
+
+Состояние sequences переносится с v0.4.0: `setval` owned sequences на target
+под source lock (включая lock самих sequences против `nextval`), auto-create
+с serial/nextval-default отклоняется.
 
 ## Матрица совместимости
 

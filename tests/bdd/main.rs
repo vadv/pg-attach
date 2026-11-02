@@ -2,7 +2,7 @@ mod postgres;
 mod steps;
 mod world;
 
-use cucumber::{writer::Stats, World};
+use cucumber::{writer::Stats as _, World as _};
 use world::AttachWorld;
 
 #[tokio::main]
@@ -13,6 +13,15 @@ async fn main() {
         .fail_fast()
         .run(features)
         .await;
+    let scenarios = writer.scenarios_stats();
+    let passed = scenarios.passed;
+    let skipped = scenarios.skipped;
+    let failed = scenarios.failed;
+    println!("BDD summary: {passed} passed, {skipped} skipped, {failed} failed");
+    if passed + skipped + failed == 0 {
+        eprintln!("no BDD scenarios matched; check PG_ATTACH_FEATURES");
+        std::process::exit(1);
+    }
     if writer.execution_has_failed() {
         std::process::exit(1);
     }

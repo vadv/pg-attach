@@ -7,12 +7,12 @@ TARGET_PG_VERSION=${TARGET_PG_VERSION:-$PG_VERSION}
 root=$(CDPATH= cd "$(dirname "$0")/../.." && pwd)
 
 # Prebuilt toolchain cache (see Dockerfile, toolchain stage). The tag is
-# derived from the same inputs as .github/workflows/images.yml computes, so
-# CI hits the registry image and a local run without BUILDER_REGISTRY just
+# derived from the same inputs as .github/workflows/images.yml computes
+# (Dockerfile + images.yml; Cargo.lock is excluded on purpose), so CI
+# hits the registry image and a local run without BUILDER_REGISTRY just
 # builds from source as before.
 hash_files() {
-  cat "$root/Dockerfile" "$root/Cargo.lock" \
-    "$root/.github/workflows/images.yml" \
+  cat "$root/Dockerfile" "$root/.github/workflows/images.yml" \
     | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-16
 }
 BUILDER_TAG=$(hash_files)
