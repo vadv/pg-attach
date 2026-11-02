@@ -195,6 +195,10 @@ Feature: Transfer resilience and rollback
       CREATE TABLE public.events(id integer PRIMARY KEY, payload text, note text);
       INSERT INTO public.events SELECT i, encode(gen_random_bytes(1000), 'hex'), 'original' FROM generate_series(1, 20000) AS i;
       """
+    And the following SQL is executed on "source":
+      """
+      VACUUM (FREEZE) public.events;
+      """
     And the following SQL is executed on "target":
       """
       CREATE EXTENSION pg_attach;
