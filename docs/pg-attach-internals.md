@@ -41,7 +41,8 @@ heap, TOAST и готовыми btree-индексами. Оно предназ�
 
 ## Два публичных сценария
 
-На обоих инстансах должна быть установлена одинаковая сборка расширения:
+На обоих инстансах должна быть установлена одна и та же версия `extension_version`,
+собранная отдельно под major-версию каждого PostgreSQL:
 
 ```sql
 CREATE EXTENSION pg_attach;
@@ -142,10 +143,12 @@ SQL pg_attach_import
 ```
 
 Handshake — первый и единственный запрос до побочных эффектов. Target требует
-одинаковые `extension_version`, PostgreSQL major и физические параметры. При
-отсутствии функции или несовпадении соединение закрывается до `VACUUM` и locks.
-Версия расширения — единственная версия совместимости pg_attach; независимых
-версий wire и schema descriptor нет.
+одинаковые `extension_version` и разрешённую major-пару: одинаковые major либо
+только upgrade 16→17, 16→18 или 17→18. Каждая сторона использует сборку этой
+версии расширения под свою major-версию PostgreSQL. Физические параметры должны
+совпадать. При отсутствии функции или несовпадении соединение закрывается до
+`VACUUM` и locks. Версия расширения — единственная версия совместимости
+pg_attach; независимых версий wire и schema descriptor нет.
 
 Дальше разберём каждую фазу.
 
@@ -246,9 +249,9 @@ magic `PGAS`, zero flags и данными схемы (`src/pg_attach/wire.rs:20
 Последний пункт важен: сохранение dropped columns позволяет применить исходные
 heap-страницы без перекладки tuple layout.
 
-Auto-create отклоняет identity columns, foreign constraints и exclusion
-constraints. Такой target можно попытаться подготовить явно, если его физическая
-схема совместима. ACL, ownership, grants и roles не переносятся.
+Auto-create отклоняет identity columns. Foreign и exclusion constraints не
+поддерживаются ни в одном режиме, включая явно подготовленный target; exclusion
+indexes также отклоняются. ACL, ownership, grants и roles не переносятся.
 
 ### Если target существует
 
@@ -258,13 +261,16 @@ constraints. Такой target можно попытаться подготов�
 
 - target table name;
 - режим checksums;
-- точный список attributes: имена, type OID, collation OID, typmod, длина,
-  `NOT NULL`, dropped-признаки;
+- точный список attributes: имена, стабильные type identities, полные collation
+  identities (provider, resolved locale, deterministic flag, encoding,
+  stored/actual versions), typmod, length, alignment, by-value, storage,
+  generated/missing flags, `NOT NULL` и dropped-признаки;
 - наличие TOAST и TOAST index;
-- количество и формы btree-индексов.
+- количество и структурные описания btree-индексов: keys, opclasses, collations,
+  options и metapage metadata.
 
-Имена индексов могут отличаться, но их определения должны совпадать. Неожиданный
-дополнительный индекс приводит к ошибке, а не молчаливому удалению.
+Имена индексов могут отличаться, но структурные описания должны совпадать.
+Неожиданный дополнительный индекс приводит к ошибке, а не молчаливому удалению.
 
 ## 4. Что именно переносится
 
@@ -284,7 +290,8 @@ constraints. Такой target можно попытаться подготов�
 импорта рекомендуется `VACUUM (ANALYZE)`.
 
 Поддерживаются только permanent plain heap tables и валидные, ready, non-partial,
-non-exclusion btree (`src/pg_attach/ffi.rs:156`, `src/pg_attach/ffi.rs:165`).
+non-expression, non-exclusion btree с opclasses из `pg_catalog`
+(`src/pg_attach/ffi.rs:156`, `src/pg_attach/ffi.rs:165`).
 
 Перед приёмом страниц target вызывает `RelationSetNewRelfilenumber` для каждого
 relation (`src/pg_attach/importer.rs:135`). Таким образом:
@@ -345,8 +352,10 @@ relation locator, tablespace, forks, сегменты и block numbers.
 1. открывает соответствующее relation;
 2. читает страницу через `pg_attach_read_page` → `smgrread`
    (`src/page_shim.c:48`);
-3. подготавливает её в C;
-4. кодирует page packet и возвращает в COPY stream.
+3. до любых изменений проверяет page layout и checksum, если она включена;
+   испорченная source-страница отклоняется;
+4. подготавливает её в C;
+5. кодирует page packet и возвращает в COPY stream.
 
 ### Heap и TOAST
 
@@ -390,12 +399,13 @@ checksum в зависимости от режима кластера.
 Первый пакет инициализирует `ImportState`. Каждый следующий проходит
 `ImportState::accept` (`src/pg_attach/importer.rs:221`):
 
-- relation index должен существовать;
-- поддерживается только main fork;
+- relation index и fork должны совпадать с manifest;
 - блоки должны идти строго последовательно;
 - номер блока не должен превышать длину из manifest;
-- `pg_attach_verify_page` проверяет базовые page bounds и checksum, если она
-  включена;
+- для main-fork страниц `pg_attach_verify_page` проверяет page layout/bounds и
+  checksum, если она включена, а для btree block zero дополнительно сверяется
+  metapage version и `allequalimage`;
+- VM и FSM переносятся byte-exact без проверки data checksum;
 - только после этого страница записывается.
 
 `pg_attach_write_page` (`src/page_shim.c:294`) использует:
@@ -519,28 +529,34 @@ CPU-работы и index rebuild**, а не с волшебным уменьш�
 
 Перед использованием нужно проверить весь список:
 
-- PostgreSQL 16, 17 или 18; одинаковая major на source и target;
-- одинаковая сборка расширения;
+- PostgreSQL 16, 17 или 18: одинаковые major или только upgrade 16→17, 16→18,
+  17→18; downgrade и остальные пары запрещены;
+- одинаковая `extension_version`, собранная отдельно под major каждой стороны;
 - совместимые architecture, encoding и physical layout;
 - страницы 8 KiB в текущем wire protocol;
 - одинаковый `data_checksums` — это явно проверяется manifest;
 - plain logged heap table;
-- только поддерживаемые btree-индексы;
-- совпадение физических attributes и type/collation OID;
+- только поддерживаемые btree-индексы с opclasses из `pg_catalog`;
+- совпадение физических attributes и стабильных type/collation identities, а не
+  совпадение type/collation OID между кластерами;
+- для database-default collation нужна concrete `pg_collation` row с совпадающими
+  provider, resolved locale и encoding; иначе перенос отклоняется;
+- fast defaults/missing values и virtual generated columns отклоняются;
 - source role может делать `VACUUM FREEZE` и `CHECKPOINT`;
 - допустима `ACCESS EXCLUSIVE` на время freeze-validate-stream;
-- для auto-create нет identity, foreign и exclusion constraints;
+- для auto-create нет identity columns; foreign и exclusion constraints не
+  поддерживаются ни в одном режиме, включая явно подготовленный target;
 - не требуется перенос ACL, ownership, grants, roles или statistics
   (VM/FSM переносятся вместе с relation);
 - для replicas/PITR используется `generate_wal = true`.
 
-Часть требований проверяется кодом, но не все. Например, совместимость major,
-архитектуры и encoding должен гарантировать оператор: manifest не является
+Handshake проверяет major-пару и physical prerequisites, а manifest — типы,
+collations и физическую схему. Это fail-closed модель, но она не делает перенос
 универсальным валидатором всех свойств двух кластеров.
 
-Не подходят partitioned/foreign/unlogged tables, cross-major upgrades, merge,
-инкрементальная репликация и миграция без блокировки. Для них нужны другие
-инструменты.
+Не подходят partitioned/foreign/unlogged tables, downgrade и пары вне указанной
+матрицы, merge, инкрементальная репликация и миграция без блокировки. Для них
+нужны другие инструменты.
 
 ## Насколько это проверено
 
