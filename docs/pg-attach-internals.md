@@ -102,7 +102,7 @@ postmaster через Unix socket и повторно вызывает обыч�
 
 | Компонент | Роль |
 | --- | --- |
-| `src/lib.rs` | SQL API на pgrx и debug-GUC для тестов |
+| `src/lib.rs` | SQL API на pgrx, debug-GUC и GUC прогресса переноса |
 | `src/pg_attach/importer.rs` | target-side orchestration, создание/проверка target, установка страниц |
 | `src/pg_attach/source_client.rs` | синхронный libpq-клиент, freeze/lock/checkpoint, чтение binary COPY |
 | `src/pg_attach/exporter.rs` | schema descriptor, manifest и поток страниц на source |
