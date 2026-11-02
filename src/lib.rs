@@ -9,6 +9,9 @@ use pgrx::guc::{GucContext, GucFlags, GucRegistry, GucSetting};
 static DEBUG_CORRUPT_PAGE: GucSetting<i32> = GucSetting::<i32>::new(-1);
 static DEBUG_CORRUPT_OFFSET: GucSetting<i32> = GucSetting::<i32>::new(-1);
 static DEBUG_DISABLE_LZ4: GucSetting<bool> = GucSetting::<bool>::new(false);
+/// Progress cadence in pages: 0 disables both `NOTICE`s and `application_name`
+/// updates.
+static PROGRESS_PAGES: GucSetting<i32> = GucSetting::<i32>::new(1024);
 
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
@@ -29,6 +32,17 @@ pub extern "C-unwind" fn _PG_init() {
         &DEBUG_CORRUPT_OFFSET,
         -1,
         8191,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
+        c"pg_attach.progress_pages",
+        c"Import progress cadence in pages (0 disables)",
+        c"Every N pages the import raises a NOTICE and updates application_name \
+         with the transfer progress; 0 disables both.",
+        &PROGRESS_PAGES,
+        0,
+        i32::MAX,
         GucContext::Userset,
         GucFlags::default(),
     );

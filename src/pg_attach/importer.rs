@@ -2,6 +2,7 @@ use super::ffi::{self, Rel, MAIN_FORK};
 use super::source_client::SourceClient;
 use super::wire::{self, Manifest, RelationKind, TableSchema};
 use pgrx::pg_sys;
+use pgrx::prelude::*;
 use pgrx::spi::Spi;
 use std::io::Cursor;
 
@@ -407,73 +408,41 @@ unsafe fn open_target(schema: &TableSchema, target_table: &str) -> Result<Target
 /// # Safety
 /// Runs inside PostgreSQL. All target relations remain exclusively locked until commit.
 #[allow(clippy::too_many_lines)] // One streaming transaction; no hidden background work.
-pub unsafe fn import(
-    source_conninfo: &str,
-    source_table: &str,
-    target_table: &str,
-    generate_wal: bool,
-) -> Result<(), String> {
-    let mut source = SourceClient::connect(source_conninfo)?;
-    source.check_compatibility()?;
-    source.prepare_direct(source_table)?;
-    let schema = source.schema(source_table)?;
-    let targets = open_target(&schema, target_table)?;
-    let target_toast_oid = targets.main.toast_oid();
-    let mut target_main = Some(targets.main);
-    let mut target_toast = targets.toast;
-    let mut target_toast_index = targets.toast_index;
-    let mut target_indexes = targets.indexes;
+/// Human-readable transfer progress for `pg_stat_activity`; fits the 63-byte
+/// `application_name` limit with room for a 24-char table name.
+fn progress_label(done: u64, total: u64, table: &str) -> String {
+    let short = if table.chars().count() > 24 {
+        table.chars().take(24).collect::<String>()
+    } else {
+        table.to_owned()
+    };
+    let pct = if done >= total {
+        100
+    } else {
+        done * 100 / total
+    };
+    format!(
+        "pg_attach {} {}/{}MB {}%",
+        short,
+        done / 128,
+        total / 128,
+        pct
+    )
+}
 
-    let target_checksums = ffi::data_checksums_enabled();
-    let target_lz4_supported = ffi::lz4_supported() && !crate::DEBUG_DISABLE_LZ4.get();
-    let command =
-        format!(
-        "COPY (SELECT pg_attach_export_stream({}, {}, {}::oid, {}, {})) TO STDOUT (FORMAT binary)",
-        quote_literal(source_table),
-        quote_literal(target_table),
-        target_toast_oid.to_u32(),
-        if target_lz4_supported { "true" } else { "false" },
-        if target_checksums { "true" } else { "false" },
+fn report_progress(done: u64, total: u64, table: &str) {
+    let label = progress_label(done, total, table);
+    // Progress must never fail the import.
+    let _ = Spi::get_one_with_args::<String>(
+        "SELECT set_config('application_name', $1, false)",
+        &[label.clone().into()],
     );
-    let mut state: Option<ImportState> = None;
+    notice!("{}", label);
+}
 
-    source.copy_out(&command, |row| {
-        if state.as_ref().is_some_and(|state| state.done) {
-            return Err("received a row after the stream terminator".into());
-        }
-        if state.is_none() {
-            let reader = wire::StreamReader::new(Cursor::new(row))
-                .map_err(|error| format!("invalid pg_attach header: {error}"))?;
-            let manifest = reader.manifest;
-            let main = target_main
-                .take()
-                .ok_or_else(|| "target table was already consumed".to_owned())?;
-            let next = prepare_state(
-                manifest,
-                target_table,
-                main,
-                target_toast.take(),
-                std::mem::take(&mut target_indexes),
-                target_toast_index.take(),
-            )?;
-            state = Some(next);
-            return Ok(());
-        }
-
-        let import = state.as_mut().unwrap();
-        let packet = wire::decode_page(row).map_err(|error| error.to_string())?;
-        match packet {
-            Some(packet) => import.accept(packet),
-            None => import.finish(generate_wal),
-        }
-    })?;
-
-    let state = state.ok_or_else(|| "source returned no pg_attach header".to_owned())?;
-    if !state.done {
-        return Err("source COPY ended without pg_attach terminator".into());
-    }
-    // Advance the target's owned sequences while the source lock still blocks
-    // nextval() there. Targets without a serial default have nothing to advance.
+/// Replays the source's owned-sequence state on the target before the source
+/// lock is released. Targets without a serial default have nothing to advance.
+fn advance_sequences(schema: &TableSchema, target_table: &str) -> Result<(), String> {
     for sequence in &schema.sequences {
         let target_sequence = Spi::get_one_with_args::<String>(
             "SELECT pg_get_serial_sequence($1, $2)",
@@ -511,7 +480,100 @@ pub unsafe fn import(
         )
         .map_err(|error| error.to_string())?;
     }
+    Ok(())
+}
+
+pub unsafe fn import(
+    source_conninfo: &str,
+    source_table: &str,
+    target_table: &str,
+    generate_wal: bool,
+) -> Result<(), String> {
+    let mut source = SourceClient::connect(source_conninfo)?;
+    source.check_compatibility()?;
+    source.prepare_direct(source_table)?;
+    let schema = source.schema(source_table)?;
+    let targets = open_target(&schema, target_table)?;
+    let target_toast_oid = targets.main.toast_oid();
+    let mut target_main = Some(targets.main);
+    let mut target_toast = targets.toast;
+    let mut target_toast_index = targets.toast_index;
+    let mut target_indexes = targets.indexes;
+
+    let target_checksums = ffi::data_checksums_enabled();
+    let target_lz4_supported = ffi::lz4_supported() && !crate::DEBUG_DISABLE_LZ4.get();
+    let command =
+        format!(
+        "COPY (SELECT pg_attach_export_stream({}, {}, {}::oid, {}, {})) TO STDOUT (FORMAT binary)",
+        quote_literal(source_table),
+        quote_literal(target_table),
+        target_toast_oid.to_u32(),
+        if target_lz4_supported { "true" } else { "false" },
+        if target_checksums { "true" } else { "false" },
+    );
+    let mut state: Option<ImportState> = None;
+    let orig_application_name =
+        Spi::get_one::<String>("SELECT current_setting('application_name')")
+            .map_err(|error| error.to_string())?;
+    let mut pages_done: u64 = 0;
+    let mut pages_total: u64 = 0;
+
+    source.copy_out(&command, |row| {
+        if state.as_ref().is_some_and(|state| state.done) {
+            return Err("received a row after the stream terminator".into());
+        }
+        if state.is_none() {
+            let reader = wire::StreamReader::new(Cursor::new(row))
+                .map_err(|error| format!("invalid pg_attach header: {error}"))?;
+            let manifest = reader.manifest;
+            pages_total = manifest
+                .relations
+                .iter()
+                .map(|r| u64::from(r.blocks))
+                .sum::<u64>();
+            let main = target_main
+                .take()
+                .ok_or_else(|| "target table was already consumed".to_owned())?;
+            let next = prepare_state(
+                manifest,
+                target_table,
+                main,
+                target_toast.take(),
+                std::mem::take(&mut target_indexes),
+                target_toast_index.take(),
+            )?;
+            state = Some(next);
+            return Ok(());
+        }
+
+        let import = state.as_mut().unwrap();
+        let packet = wire::decode_page(row).map_err(|error| error.to_string())?;
+        match packet {
+            Some(packet) => {
+                pages_done += 1;
+                let cadence = u64::try_from(crate::PROGRESS_PAGES.get()).unwrap_or(0);
+                if cadence > 0 && pages_total > 0 && pages_done.is_multiple_of(cadence) {
+                    report_progress(pages_done, pages_total, source_table);
+                }
+                import.accept(packet)
+            }
+            None => import.finish(generate_wal),
+        }
+    })?;
+
+    let state = state.ok_or_else(|| "source returned no pg_attach header".to_owned())?;
+    if !state.done {
+        return Err("source COPY ended without pg_attach terminator".into());
+    }
+    advance_sequences(&schema, target_table)?;
     source.commit()?;
+    // On error the whole transaction (and the name change) rolls back; on
+    // success the session must keep whatever application_name it had.
+    Spi::get_one_with_args::<String>(
+        "SELECT set_config('application_name', $1, false)",
+        &[orig_application_name.into()],
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
@@ -541,4 +603,40 @@ pub unsafe fn import_local(
         target_table,
         generate_wal,
     )
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::progress_label;
+
+    #[test]
+    fn label_fits_application_name_limit() {
+        let cases = [
+            (0u64, 1u64, "public.events"),
+            (128, 256, "public.events"),
+            (1_000_000, 4_000_000, "public.imported_events"),
+            (
+                128 * 1024,
+                0,
+                "public.a_very_long_table_name_beyond_twenty_four_chars",
+            ),
+        ];
+        for (done, total, table) in cases {
+            let label = progress_label(done, total, table);
+            assert!(label.len() <= 63, "{label} is {} bytes", label.len());
+            assert!(label.starts_with("pg_attach "), "{label}");
+        }
+    }
+
+    #[test]
+    fn label_counts_and_percent() {
+        assert_eq!(
+            progress_label(128, 256, "public.events"),
+            "pg_attach public.events 1/2MB 50%"
+        );
+        assert_eq!(
+            progress_label(128 * 1024, 0, "public.events"),
+            "pg_attach public.events 1024/0MB 100%"
+        );
+    }
 }

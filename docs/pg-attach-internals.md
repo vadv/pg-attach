@@ -102,7 +102,7 @@ postmaster через Unix socket и повторно вызывает обыч�
 
 | Компонент | Роль |
 | --- | --- |
-| `src/lib.rs` | SQL API на pgrx и debug-GUC для тестов |
+| `src/lib.rs` | SQL API на pgrx, debug-GUC и GUC прогресса переноса |
 | `src/pg_attach/importer.rs` | target-side orchestration, создание/проверка target, установка страниц |
 | `src/pg_attach/source_client.rs` | синхронный libpq-клиент, freeze/lock/checkpoint, чтение binary COPY |
 | `src/pg_attach/exporter.rs` | schema descriptor, manifest и поток страниц на source |
@@ -432,6 +432,17 @@ Target heap, TOAST и индексы остаются под `ACCESS EXCLUSIVE` 
 вызывающей транзакции. Ошибка в середине потока откатывает создание новой таблицы
 или замену relfilenumber существующей, поэтому partial data не должна становиться
 видимым новым состоянием target.
+
+### Прогресс переноса
+
+Каждые `pg_attach.progress_pages` страниц (1024 по умолчанию, 0 — отключить)
+импортёр поднимает `NOTICE` и переписывает `application_name` своего бэкенда
+через `set_config(..., false)` — метка сразу видна в `pg_stat_activity` любой
+сессии, потому что сессионный GUC применяется без ожидания коммита. Тотал
+берётся из manifest (сумма `blocks` всех relation), поэтому процент точный.
+После успешного импорта имя восстанавливается; при ошибке откатывается вместе
+с транзакцией. Отдельного парсинга нет — метка человекочитаема:
+`pg_attach public.events 412/1023MB 40%`.
 
 ## 8. WAL и durability
 

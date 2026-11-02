@@ -37,7 +37,10 @@ RUN mkdir -p src \
 
 FROM toolchain AS build
 COPY src ./src
-RUN cargo fmt --all -- --check \
+# COPY preserves mtimes; touch the real C source so cc does not reuse the
+# empty stub's newer object file from the dependency-prebuild layer.
+RUN touch src/page_shim.c \
+    && cargo fmt --all -- --check \
     && cargo test --locked --no-default-features --features "pg${PG_VERSION}" \
     && cargo clippy --locked --all-targets --no-default-features --features "pg${PG_VERSION}" -- -D warnings -D clippy::pedantic
 RUN cargo pgrx install --release --no-default-features --features "pg${PG_VERSION}" \
