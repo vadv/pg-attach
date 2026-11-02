@@ -233,15 +233,19 @@ async fn source_writer_is_blocked(world: &mut AttachWorld, step: &Step) {
     let pair = world.pair.as_ref().expect("PostgreSQL pair is not running");
     let import = pair.execute("target", &sql);
     tokio::pin!(import);
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         assert!(
             std::time::Instant::now() < deadline,
-            "source import did not acquire AccessExclusiveLock"
+            "source import did not reach the streaming read lock"
         );
+        // The auto-freeze protocol may release its first AccessExclusiveLock
+        // and reopen it after VACUUM FREEZE; writers may commit in that gap
+        // legitimately. The blocking guarantee starts only when the lock is
+        // held by the streaming COPY, which never retries and ends in COMMIT.
         let check = pair.query(
             "source",
-            "SELECT count(*)::text FROM pg_locks l JOIN pg_class c ON c.oid = l.relation JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relname = 'events' AND l.mode = 'AccessExclusiveLock' AND l.granted",
+            "SELECT count(*)::text FROM pg_locks l JOIN pg_class c ON c.oid = l.relation JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_stat_activity a ON a.pid = l.pid WHERE n.nspname = 'public' AND c.relname = 'events' AND l.mode = 'AccessExclusiveLock' AND l.granted AND a.state = 'active' AND a.query LIKE 'COPY (SELECT pg_attach_export_stream(%'",
         );
         tokio::pin!(check);
         let result = tokio::select! {
