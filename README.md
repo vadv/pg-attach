@@ -96,6 +96,22 @@ postmaster: no libpq connection is opened.
 Writers to the source table are blocked for the read window (freeze → end of
 stream). This is full overwrite, not a merge.
 
+## Monitoring a transfer
+
+Every `pg_attach.progress_pages` pages (1024 by default, `0` disables) the
+import raises a `NOTICE` and rewrites its backend's `application_name` to a
+compact label, visible to any session while the transfer runs:
+
+```sql
+SELECT pid, application_name FROM pg_stat_activity
+ WHERE application_name LIKE 'pg_attach %';
+--  pg_attach public.events 412/1023MB 40%
+```
+
+The name is restored when the import finishes; on failure the whole
+transaction — including the name change — rolls back. The label shows pages
+transferred so far over the total from the manifest, in MB (1 MB = 128 pages).
+
 ## Requirements and limits
 
 - Matching architecture, `BLCKSZ`, alignment, endianness, encoding, TOAST

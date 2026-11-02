@@ -611,7 +611,7 @@ mod tests {
             endianness: "little".to_owned(),
             server_encoding: "UTF8".to_owned(),
             data_checksums: true,
-            extension_version: "0.4.0".to_owned(),
+            extension_version: "0.5.0".to_owned(),
             max_toast_chunk_size: 1996,
             max_identifier_length: 63,
             checksum_algorithm_version: 1,
