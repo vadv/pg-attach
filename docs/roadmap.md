@@ -8,8 +8,8 @@
 Поддерживаются same-major PostgreSQL 16–18 и upward physical transfer 16→17,
 16→18, 17→18 для whitelist-типов и simple btree. Page layout, `BLCKSZ`, encoding,
 checksum mode и остальные physical prerequisites должны совпадать; downgrade и
-конвертация tuples запрещены. Точные типы и ограничения описаны в
-`docs/cross-version-roadmap.md`.
+конвертация tuples запрещены. Точные типы и ограничения описаны в разделе
+Scope `README.md`.
 
 - `pg16`, `pg17`, `pg18` — отдельные Cargo features pgrx 0.19.3;
 - каждая сборка выбирает ровно одну feature и соответствующий `pg_config`;

@@ -131,6 +131,29 @@ second time to reach the same frozen state. If COPY never freezes by hand,
 the cost is not gone — autovacuum pays it later by rereading the whole
 table in the background.
 
+## events l (~10 GB, 1M rows) — Docker Desktop local, single repeat
+
+Full-matrix local run on the final post-VM/FSM code (fresh container per
+method, same harness, PG17). At this size the dataset exceeds the page
+cache, so `rbytes` becomes real disk reads — the only configuration where
+that column is meaningful. Single repeat per method; treat as scale
+confirmation, not a precision measurement.
+
+| method | wall_s | cpu_s | rbytes | wbytes | lsn_bytes |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| attach-local-nowal | 55.3 | 53.9 | 24.9 GB | 37.4 GB | 10.97 GB |
+| attach-local-wal | 69.0 | 67.2 | 37.4 GB | 48.6 GB | 21.9 GB |
+| attach-network | 61.0 | 59.9 | 36.4 GB | 49.4 GB | 21.9 GB |
+| copy-text | 166.7 | 207.6 | 35.0 GB | 62.5 GB | 22.4 GB |
+| copy-binary | 160.1 | 189.0 | 34.5 GB | 62.7 GB | 22.3 GB |
+| dump-text | 159.2 | 199.2 | 34.0 GB | 62.5 GB | 22.4 GB |
+| dump-fc (-j4) | 404.1 | 422.7 | 43.3 GB | 71.4 GB | 22.4 GB |
+
+attach-local-nowal vs copy-binary: **2.9x wall / 3.5x CPU**; vs copy-text
+3.0x / 3.9x; vs dump-fc 7.3x / 7.8x. WAL 10.97 vs ~22.4 GB (2x), written
+bytes 37.4 vs ~62.6 GB (1.7x). The m-size ratios hold at 10x scale; raw
+CSV: `target/benchmark/results-17.csv`.
+
 ## Reference: Docker Desktop local run (same harness, PG17)
 
 Events m wall: attach-local-nowal 3.7 s, attach-local-wal 4.4 s,
@@ -153,5 +176,5 @@ PG_VERSION=17 ./benchmark/run.sh`. Raw CSV of the reference run:
   destination needed for end-state parity with attach (see above).
 - `dump-fc -j4` cannot parallelize a single-table restore; its cost is
   dominated by custom-format compression.
-- Sizes beyond m (l = ~10 GB) were run locally for wall/CPU only; the
-  Linux runner disk budget fits m comfortably.
+- l (~10 GB) numbers come from a local Docker Desktop single-repeat run
+  (section above); the Linux runner disk budget fits m comfortably.
