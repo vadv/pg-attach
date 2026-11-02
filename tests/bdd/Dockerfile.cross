@@ -5,6 +5,12 @@ FROM rust:1.99-bookworm AS build
 RUN rustup component add clippy
 WORKDIR /work
 COPY tests/bdd/Cargo.toml tests/bdd/Cargo.lock ./
+# Stub binary: prebuild dependencies in the release profile (plain and clippy
+# fingerprints) so later harness changes recompile only this crate; real
+# sources overwrite the stub.
+RUN echo 'fn main() {}' > main.rs \
+    && cargo build --release --locked \
+    && cargo clippy --release --locked -- -D warnings -D clippy::pedantic
 COPY tests/bdd/main.rs tests/bdd/postgres.rs tests/bdd/steps.rs tests/bdd/world.rs ./
 RUN cargo clippy --release --all-targets --locked -- -D warnings -D clippy::pedantic \
     && cargo test --release --locked \
