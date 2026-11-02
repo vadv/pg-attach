@@ -110,7 +110,10 @@ stream). This is full overwrite, not a merge.
   stored/actual versions) must match. lz4 values are rejected when the target
   lacks lz4. Automatic creation rejects identity columns and serial/nextval
   defaults; with a pre-created target, owned sequence state (`last_value`,
-  `is_called`) is advanced on the target while the source lock is held.
+  `is_called`) is advanced on the target while the source lock is held. A
+  pre-created target column whose default calls `nextval()` on a sequence the
+  column does not own is rejected — own it (`ALTER SEQUENCE ... OWNED BY`) or
+  advance it manually.
 - Foreign and exclusion constraints are unsupported in every mode.
 - No partitions, foreign tables, unlogged tables, non-btree indexes,
   downgrades or differing checksum modes.

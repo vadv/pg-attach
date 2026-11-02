@@ -480,17 +480,36 @@ pub unsafe fn import(
             &[target_table.into(), sequence.column.as_str().into()],
         )
         .map_err(|error| error.to_string())?;
-        if let Some(target_sequence) = target_sequence {
-            Spi::get_one_with_args::<i64>(
-                "SELECT setval($1::regclass, $2, $3)",
-                &[
-                    target_sequence.into(),
-                    sequence.last_value.into(),
-                    sequence.is_called.into(),
-                ],
+        let Some(target_sequence) = target_sequence else {
+            // Distinguish a column without a sequence from one fed by a
+            // sequence the column does not own: pg_get_serial_sequence
+            // returns NULL for both, but only the latter needs the state.
+            let default = Spi::get_one_with_args::<String>(
+                "SELECT pg_get_expr(adbin, adrelid) \
+                 FROM pg_attrdef ad \
+                 JOIN pg_attribute a ON a.attrelid = ad.adrelid AND a.attnum = ad.adnum \
+                 WHERE ad.adrelid = $1::regclass AND a.attname = $2",
+                &[target_table.into(), sequence.column.as_str().into()],
             )
             .map_err(|error| error.to_string())?;
-        }
+            if default.as_deref().is_some_and(|d| d.contains("nextval(")) {
+                return Err(format!(
+                    "target column {} uses nextval() on a sequence the column does not own; \
+                     transfer its state manually or use ALTER SEQUENCE ... OWNED BY",
+                    sequence.column
+                ));
+            }
+            continue;
+        };
+        Spi::get_one_with_args::<i64>(
+            "SELECT setval($1::regclass, $2, $3)",
+            &[
+                target_sequence.into(),
+                sequence.last_value.into(),
+                sequence.is_called.into(),
+            ],
+        )
+        .map_err(|error| error.to_string())?;
     }
     source.commit()?;
     Ok(())

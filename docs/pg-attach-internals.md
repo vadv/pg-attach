@@ -255,7 +255,9 @@ heap-страницы без перекладки tuple layout.
 Auto-create отклоняет identity columns и serial/nextval-defaults. Для явно
 подготовленного target после импорта выполняется `setval(last_value, is_called)`
 owned sequences target (`pg_get_serial_sequence` по имени колонки); target без
-serial-default просто пропускается. Foreign и exclusion constraints не
+serial-default просто пропускается, а колонка с `nextval()` на не-owned
+sequence отклоняется (иначе setval молча пропускался бы и первый INSERT после
+переноса получил бы duplicate key). Foreign и exclusion constraints не
 поддерживаются ни в одном режиме, включая явно подготовленный target; exclusion
 indexes также отклоняются. ACL, ownership, grants и roles не переносятся.
 

@@ -92,3 +92,25 @@ Feature: Sequence state transfer
       """
       SELECT count(*), max(id) FROM public.imported_events;
       """
+
+  Scenario: An unowned nextval default on the target is rejected
+    When the following SQL is executed on "source":
+      """
+      INSERT INTO public.events(payload)
+      SELECT 'row-' || i FROM generate_series(1, 10) AS i;
+      """
+    And the following SQL is executed on "target":
+      """
+      CREATE SEQUENCE public.imported_events_id_seq;
+      CREATE TABLE public.imported_events (
+        id integer PRIMARY KEY DEFAULT nextval('public.imported_events_id_seq'),
+        payload text
+      );
+      """
+    And the following SQL on "target" fails with "uses nextval() on a sequence the column does not own":
+      """
+      SELECT pg_attach_import(
+        'host=127.0.0.1 port=${SOURCE_PORT} dbname=postgres user=postgres',
+        'public.events', 'public.imported_events', true
+      );
+      """
