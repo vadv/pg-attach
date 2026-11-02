@@ -185,11 +185,20 @@ pub struct SchemaIndex {
     pub unique: bool,
 }
 
+/// State of a sequence owned by a source column, read under the source lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SequenceState {
+    pub column: String,
+    pub last_value: i64,
+    pub is_called: bool,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TableSchema {
     pub columns: Vec<SchemaColumn>,
     pub constraints: Vec<String>,
     pub indexes: Vec<SchemaIndex>,
+    pub sequences: Vec<SequenceState>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -354,6 +363,17 @@ pub fn encode_schema(schema: &TableSchema) -> Result<Vec<u8>> {
         put_string(&mut out, &index.definition)?;
         out.push(u8::from(index.unique));
     }
+    put_len(
+        &mut out,
+        schema.sequences.len(),
+        MAX_ATTRIBUTES,
+        "schema sequences",
+    )?;
+    for sequence in &schema.sequences {
+        put_string(&mut out, &sequence.column)?;
+        out.extend_from_slice(&sequence.last_value.to_be_bytes());
+        out.push(u8::from(sequence.is_called));
+    }
     Ok(out)
 }
 
@@ -396,6 +416,15 @@ pub fn decode_schema(input: &[u8]) -> Result<TableSchema> {
             unique: decoder.boolean()?,
         });
     }
+    let sequence_count = decoder.len(MAX_ATTRIBUTES, "schema sequences")?;
+    let mut sequences = Vec::with_capacity(sequence_count);
+    for _ in 0..sequence_count {
+        sequences.push(SequenceState {
+            column: decoder.string()?,
+            last_value: decoder.i64()?,
+            is_called: decoder.boolean()?,
+        });
+    }
     if decoder.offset != decoder.input.len() {
         return Err(WireError("trailing bytes in schema descriptor".into()));
     }
@@ -403,6 +432,7 @@ pub fn decode_schema(input: &[u8]) -> Result<TableSchema> {
         columns,
         constraints,
         indexes,
+        sequences,
     })
 }
 
@@ -637,6 +667,10 @@ impl Decoder<'_> {
         Ok(i32::from_be_bytes(self.take(4)?.try_into().unwrap()))
     }
 
+    fn i64(&mut self) -> Result<i64> {
+        Ok(i64::from_be_bytes(self.take(8)?.try_into().unwrap()))
+    }
+
     fn i16(&mut self) -> Result<i16> {
         Ok(i16::from_be_bytes(self.take(2)?.try_into().unwrap()))
     }
@@ -785,6 +819,11 @@ mod tests {
                 definition: "btree (payload)".into(),
                 unique: true,
             }],
+            sequences: vec![SequenceState {
+                column: "id".into(),
+                last_value: 42,
+                is_called: true,
+            }],
         };
         let encoded = encode_schema(&value).unwrap();
         assert_eq!(decode_schema(&encoded).unwrap(), value);
@@ -826,6 +865,7 @@ mod tests {
             columns: Vec::new(),
             constraints: Vec::new(),
             indexes: Vec::new(),
+            sequences: Vec::new(),
         })
         .unwrap();
         assert_eq!(SCHEMA_HEADER_LEN, 6);
@@ -843,6 +883,7 @@ mod tests {
             columns: Vec::new(),
             constraints: Vec::new(),
             indexes: Vec::new(),
+            sequences: Vec::new(),
         })
         .unwrap();
         schema[4] = 1;

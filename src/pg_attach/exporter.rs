@@ -162,6 +162,40 @@ pub unsafe fn source_metadata(source_table: &str) -> Result<String, String> {
     Ok(snapshot)
 }
 
+/// Owned (serial/auto) sequences of a table as (column name, sequence oid).
+/// Identity columns use internal dependencies and are rejected elsewhere, but
+/// locking them here too is harmless and keeps the predicate complete.
+fn owned_sequences(source_oid: pg_sys::Oid) -> Result<Vec<(String, pg_sys::Oid)>, String> {
+    Spi::connect_mut(|client| {
+        let rows = client
+            .select(
+                "SELECT a.attname::text, d.objid \
+                 FROM pg_depend d \
+                 JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S' \
+                 JOIN pg_attribute a ON a.attrelid = d.refobjid AND a.attnum = d.refobjsubid \
+                 WHERE d.refobjid = $1 AND d.classid = 'pg_class'::regclass \
+                 AND d.refclassid = 'pg_class'::regclass AND d.deptype IN ('a', 'i') \
+                 ORDER BY a.attnum",
+                None,
+                &[source_oid.into()],
+            )
+            .map_err(|error| error.to_string())?;
+        let mut sequences = Vec::with_capacity(rows.len());
+        for row in rows {
+            let column = row
+                .get::<String>(1)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "owned sequence column name is empty".to_owned())?;
+            let oid = row
+                .get::<pg_sys::Oid>(2)
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "owned sequence oid is empty".to_owned())?;
+            sequences.push((column, oid));
+        }
+        Ok(sequences)
+    })
+}
+
 /// Export only catalog metadata needed to recreate a table. No SQL dump tool or
 /// server-side procedural language is involved; the descriptor is binary.
 #[allow(clippy::too_many_lines)] // Keep catalog reads and descriptor order in one transaction.
@@ -303,10 +337,45 @@ pub unsafe fn export_schema(source_table: &str) -> Result<Vec<u8>, String> {
         Ok::<_, String>(indexes)
     })?;
 
+    let owned = owned_sequences(source_oid)?;
+    let sequences = Spi::connect_mut(|client| {
+        let mut sequences = Vec::with_capacity(owned.len());
+        for (column, oid) in owned {
+            // Numeric oid cast to regclass is safe without identifier quoting.
+            let rows = client
+                .select(
+                    &format!(
+                        "SELECT last_value, is_called FROM {}::regclass",
+                        oid.to_u32()
+                    ),
+                    None,
+                    &[],
+                )
+                .map_err(|error| error.to_string())?;
+            let row = rows
+                .into_iter()
+                .next()
+                .ok_or_else(|| format!("owned sequence of column {column} returned no state"))?;
+            sequences.push(wire::SequenceState {
+                column,
+                last_value: row
+                    .get::<i64>(1)
+                    .map_err(|error| error.to_string())?
+                    .ok_or_else(|| "sequence last_value is null".to_owned())?,
+                is_called: row
+                    .get::<bool>(2)
+                    .map_err(|error| error.to_string())?
+                    .unwrap_or(false),
+            });
+        }
+        Ok::<_, String>(sequences)
+    })?;
+
     wire::encode_schema(&TableSchema {
         columns,
         constraints,
         indexes,
+        sequences,
     })
     .map_err(|error| error.to_string())
 }
@@ -499,6 +568,11 @@ pub unsafe fn lock_source(source_table: &str) -> Result<(), String> {
     let relation = Rel::open(oid, pg_sys::AccessExclusiveLock.cast_signed());
     if !relation.is_plain_logged_table() {
         return Err("source must be a plain logged table".into());
+    }
+    // LOCK TABLE on the heap does not stop nextval() on owned sequences;
+    // lock them too so their state cannot drift before the target setval.
+    for (_, sequence_oid) in owned_sequences(oid)? {
+        Rel::open(sequence_oid, pg_sys::AccessExclusiveLock.cast_signed());
     }
     Ok(())
 }

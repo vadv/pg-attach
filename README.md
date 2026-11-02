@@ -108,7 +108,9 @@ stream). This is full overwrite, not a merge.
 - Fast defaults/missing values and virtual generated columns are rejected.
   Collation identity (name, provider, locale, deterministic flag, encoding,
   stored/actual versions) must match. lz4 values are rejected when the target
-  lacks lz4. Automatic creation rejects identity columns.
+  lacks lz4. Automatic creation rejects identity columns and serial/nextval
+  defaults; with a pre-created target, owned sequence state (`last_value`,
+  `is_called`) is advanced on the target while the source lock is held.
 - Foreign and exclusion constraints are unsupported in every mode.
 - No partitions, foreign tables, unlogged tables, non-btree indexes,
   downgrades or differing checksum modes.

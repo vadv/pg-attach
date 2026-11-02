@@ -230,7 +230,10 @@ Lock уже удерживается, поэтому новые dirty pages эт
 - collation, defaults, generated expressions и `NOT NULL`;
 - dropped columns;
 - поддерживаемые constraints;
-- определения btree-индексов без привязки к исходным именам таблицы и индекса.
+- определения btree-индексов без привязки к исходным именам таблицы и индекса;
+- состояние owned sequences (`last_value`, `is_called`) по колонкам, прочитанное
+  под source lock; `pg_attach_lock_source` дополнительно берёт `ACCESS EXCLUSIVE`
+  на сами sequences, потому что lock таблицы не останавливает `nextval()`.
 
 Это не `pg_dump` и не SQL-скрипт: по проводу передаётся бинарный descriptor с
 magic `PGAS`, zero flags и данными схемы (`src/pg_attach/wire.rs:205`). Target
@@ -249,7 +252,10 @@ magic `PGAS`, zero flags и данными схемы (`src/pg_attach/wire.rs:20
 Последний пункт важен: сохранение dropped columns позволяет применить исходные
 heap-страницы без перекладки tuple layout.
 
-Auto-create отклоняет identity columns. Foreign и exclusion constraints не
+Auto-create отклоняет identity columns и serial/nextval-defaults. Для явно
+подготовленного target после импорта выполняется `setval(last_value, is_called)`
+owned sequences target (`pg_get_serial_sequence` по имени колонки); target без
+serial-default просто пропускается. Foreign и exclusion constraints не
 поддерживаются ни в одном режиме, включая явно подготовленный target; exclusion
 indexes также отклоняются. ACL, ownership, grants и roles не переносятся.
 
