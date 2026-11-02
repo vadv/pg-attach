@@ -352,8 +352,10 @@ relation locator, tablespace, forks, сегменты и block numbers.
 1. открывает соответствующее relation;
 2. читает страницу через `pg_attach_read_page` → `smgrread`
    (`src/page_shim.c:48`);
-3. до любых изменений проверяет page layout и checksum, если она включена;
-   испорченная source-страница отклоняется;
+3. только для MAIN_FORK страниц до любых изменений проверяет page layout и
+   checksum, если она включена; испорченная source-страница отклоняется. VM и
+   FSM страницы пропускают layout/data-checksum verification и копируются
+   byte-exact;
 4. подготавливает её в C;
 5. кодирует page packet и возвращает в COPY stream.
 
