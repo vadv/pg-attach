@@ -1,6 +1,8 @@
 PG_VERSION ?= 17
 PG_SOURCE ?= $(PG_VERSION)
 PG_TARGET ?= $(PG_VERSION)
+BUILDER_REGISTRY ?=
+export BUILDER_REGISTRY
 PG_CONFIG ?= pg_config
 CARGO ?= cargo
 
@@ -8,7 +10,7 @@ PG_CONFIG_PATH = $(shell command -v "$(PG_CONFIG)" 2>/dev/null)
 DETECTED_PG_VERSION = $(shell $(PG_CONFIG_PATH) --version 2>/dev/null | sed -E 's/^PostgreSQL ([0-9]+).*/\1/')
 export PGRX_PG_CONFIG_PATH = $(PG_CONFIG_PATH)
 
-.PHONY: all build check-pg-config test lint bdd clean
+.PHONY: all build check-pg-config test lint bdd builder clean
 
 all: build
 
@@ -33,6 +35,10 @@ lint: check-pg-config
 
 bdd:
 	PG_VERSION=$(PG_TARGET) SOURCE_PG_VERSION=$(PG_SOURCE) TARGET_PG_VERSION=$(PG_TARGET) ./tests/bdd/run.sh
+
+builder:
+	docker build --target toolchain --build-arg PG_VERSION=$(PG_VERSION) \
+	  -t pg-attach-builder-pg$(PG_VERSION):dev .
 
 clean:
 	$(CARGO) clean

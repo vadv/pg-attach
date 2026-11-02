@@ -1,0 +1,73 @@
+name: images
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - Dockerfile
+      - Cargo.lock
+      - .github/workflows/images.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_PREFIX: ${{ github.repository }}
+
+jobs:
+  builders:
+    name: builder-pg${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: [16, 17, 18]
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Compute toolchain tag
+        # Same inputs as tests/bdd/run.sh derives locally: Dockerfile +
+        # Cargo.lock. A change to either produces a new tag, so stale
+        # builder layers are never reused as cache.
+        id: tag
+        run: echo "tag=$(cat Dockerfile Cargo.lock | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+
+      - name: Log in to GHCR
+        # ghcr.io auth intermittently times out under GHA load; retry the
+        # handshake instead of failing the whole job.
+        run: |
+          for attempt in 1 2 3; do
+            if echo "${{ secrets.GITHUB_TOKEN }}" \
+              | docker login "$REGISTRY" -u '${{ github.actor }}' --password-stdin; then
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "ghcr login failed after 3 attempts" >&2
+          exit 1
+
+      - name: Check if builder already exists
+        id: exists
+        run: |
+          image="$REGISTRY/${IMAGE_PREFIX}/builder-pg${{ matrix.pg }}:${{ steps.tag.outputs.tag }}"
+          if docker manifest inspect "$image" > /dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "builder already pushed: $image"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build and push builder image
+        if: steps.exists.outputs.exists != 'true'
+        run: |
+          image="$REGISTRY/${IMAGE_PREFIX}/builder-pg${{ matrix.pg }}:${{ steps.tag.outputs.tag }}"
+          docker build --target toolchain \
+            --build-arg PG_VERSION=${{ matrix.pg }} \
+            -t "$image" .
+          docker push "$image"
