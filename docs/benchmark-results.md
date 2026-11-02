@@ -152,7 +152,7 @@ confirmation, not a precision measurement.
 attach-local-nowal vs copy-binary: **2.9x wall / 3.5x CPU**; vs copy-text
 3.0x / 3.9x; vs dump-fc 7.3x / 7.8x. WAL 10.97 vs ~22.4 GB (2x), written
 bytes 37.4 vs ~62.6 GB (1.7x). The m-size ratios hold at 10x scale; raw
-CSV: `target/benchmark/results-17.csv`.
+CSV: `benchmark/results/events-l-10gb-docker-desktop.csv`.
 
 ## Reference: Docker Desktop local run (same harness, PG17)
 
@@ -166,7 +166,8 @@ attach-network 5.1 s, copy-binary 13.0 s, copy-text 14.0 s, dump-text
 The workflow is `workflow_dispatch` only (after this branch merges to
 main): `gh workflow run benchmark`. Locally: `SIZES="m" REPEATS=3
 PG_VERSION=17 ./benchmark/run.sh`. Raw CSV of the reference run:
-`target/benchmark-ci-final.csv` (also attached to run `41289820691`).
+`benchmark/results/runner-m-github-actions.csv` (also attached to run
+`41289820691`).
 
 ## Known limits
 
